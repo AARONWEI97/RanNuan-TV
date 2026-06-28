@@ -1,0 +1,64 @@
+# ── IDE ──
+.vscode/
+.idea/
+*.iml
+android-studio/
+
+# ── 依赖 ──
+node_modules/
+**/node_modules/
+
+# ── 构建产物 ──
+dist/
+build/
+**/build/
+.gradle/
+*.apk
+*.aab
+*.exe
+*.msi
+
+# ── Tauri 构建 ──
+src-tauri/target/
+src-tauri/gen/
+
+# ── Android ──
+local.properties
+*.keystore
+*.jks
+captures/
+.externalNativeBuild/
+
+# ── 缓存 / 日志 ──
+*.log
+.cache/
+*.cache
+npm-debug.log*
+temp/
+tmp/
+.pnpm-store/
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ── 环境 ──
+.env
+.env.*
+!.env.example
+
+# ── 杂项 ──
+*.pyc
+__pycache__/
+*.tgz
+package-lock.json
+yarn.lock
+nul  
+_multitest.json  
+console.log*  
+"RanNuan TV/apps/mobile-android/nul"  
+_multitest.json  
+"console.log('ERR'"  
+actor_index.json  
+actor_index.json  

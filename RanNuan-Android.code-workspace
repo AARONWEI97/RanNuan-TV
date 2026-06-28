@@ -1,0 +1,25 @@
+{
+  "folders": [
+    {
+      "name": "Android (mobile-android)",
+      "path": "RanNuan TV/apps/mobile-android"
+    },
+    {
+      "name": "Server",
+      "path": "RanNuan TV/server"
+    },
+    {
+      "name": "Desktop",
+      "path": "RanNuan TV/apps/desktop"
+    }
+  ],
+  "settings": {
+    "java.import.exclusions": [
+      "**/apps/mobile/**",
+      "**/node_modules/**"
+    ],
+    "files.exclude": {
+      "**/apps/mobile": true
+    }
+  }
+}

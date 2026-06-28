@@ -1,0 +1,217 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: #09090b;
+}
+
+/* ========== 滚动条 ========== */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.15); }
+
+/* ========== 液态玻璃工具类 ========== */
+@layer utilities {
+  .glass {
+    background: rgba(255, 255, 255, 0.03);
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+  }
+  .glass-strong {
+    background: rgba(255, 255, 255, 0.06);
+    backdrop-filter: blur(32px) saturate(200%);
+    -webkit-backdrop-filter: blur(32px) saturate(200%);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+  }
+  .glass-card {
+    background: rgba(255, 255, 255, 0.04);
+    backdrop-filter: blur(16px) saturate(150%);
+    -webkit-backdrop-filter: blur(16px) saturate(150%);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .glass-card:hover {
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.12);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(6, 182, 212, 0.15);
+    transform: translateY(-4px);
+  }
+  .glass-glow {
+    box-shadow: 0 0 40px -10px rgba(6, 182, 212, 0.2), 0 8px 24px rgba(0, 0, 0, 0.5);
+  }
+}
+
+/* ========== 流体渐变动画 ========== */
+@keyframes fluidGradient {
+  0%   { background-position: 0% 50%; }
+  25%  { background-position: 100% 0%; }
+  50%  { background-position: 100% 100%; }
+  75%  { background-position: 0% 100%; }
+  100% { background-position: 0% 50%; }
+}
+
+@keyframes floatOrb {
+  0%, 100% { transform: translate(0px, 0px) scale(1); }
+  33%      { transform: translate(30px, -40px) scale(1.05); }
+  66%      { transform: translate(-20px, 20px) scale(0.95); }
+}
+
+@keyframes pulseGlow {
+  0%, 100% { opacity: 0.4; transform: scale(1); }
+  50%      { opacity: 0.7; transform: scale(1.15); }
+}
+
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes nowPlayingBar {
+  0%, 100% {
+    height: 4px;
+    opacity: 0.55;
+  }
+  50% {
+    height: 16px;
+    opacity: 1;
+  }
+}
+
+.animate-now-playing-bar {
+  height: 4px;
+  animation: nowPlayingBar 0.82s ease-in-out infinite;
+}
+
+/* ========== 滚动展示动画 ========== */
+@keyframes revealUp {
+  from {
+    opacity: 0;
+    transform: translateY(32px) scale(0.96);
+    filter: blur(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0);
+  }
+}
+
+.animate-reveal {
+  animation: revealUp 0.7s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.animate-reveal-delay-1 { animation-delay: 0.05s; }
+.animate-reveal-delay-2 { animation-delay: 0.1s; }
+.animate-reveal-delay-3 { animation-delay: 0.15s; }
+.animate-reveal-delay-4 { animation-delay: 0.2s; }
+.animate-reveal-delay-5 { animation-delay: 0.25s; }
+.animate-reveal-delay-6 { animation-delay: 0.3s; }
+
+/* ========== Sidebar 侧边栏动画 ========== */
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateY(-50%) scaleY(0);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(-50%) scaleY(1);
+  }
+}
+.animate-slideIn {
+  animation: slideIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* ========== 流体背景装饰球 ========== */
+.fluid-orb {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(80px);
+  pointer-events: none;
+  animation: floatOrb 20s ease-in-out infinite;
+}
+.fluid-orb:nth-child(1) {
+  width: 600px;
+  height: 600px;
+  background: radial-gradient(circle, rgba(6, 182, 212, 0.15), transparent 70%);
+  top: -200px;
+  right: -100px;
+  animation-delay: 0s;
+}
+.fluid-orb:nth-child(2) {
+  width: 400px;
+  height: 400px;
+  background: radial-gradient(circle, rgba(139, 92, 246, 0.12), transparent 70%);
+  bottom: 20%;
+  left: -150px;
+  animation-delay: -7s;
+}
+.fluid-orb:nth-child(3) {
+  width: 300px;
+  height: 300px;
+  background: radial-gradient(circle, rgba(236, 72, 153, 0.1), transparent 70%);
+  top: 40%;
+  right: 30%;
+  animation-delay: -14s;
+}
+
+/* ========== Banner 流体渐变 ========== */
+.fluid-gradient-bg {
+  background: linear-gradient(
+    135deg,
+    #09090b 0%,
+    #0c1425 20%,
+    #0d1628 40%,
+    #0a1620 60%,
+    #0c1220 80%,
+    #09090b 100%
+  );
+  background-size: 400% 400%;
+  animation: fluidGradient 15s ease infinite;
+}
+
+/* ========== 文字渐变 ========== */
+.text-gradient-cyan {
+  background: linear-gradient(135deg, #22d3ee, #06b6d4, #0891b2);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ========== 抽屉滚动条 ========== */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 4px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 2px;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/* ========== 淡入动画 ========== */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
