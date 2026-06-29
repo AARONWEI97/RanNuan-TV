@@ -16,6 +16,7 @@ import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -28,6 +29,7 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.rannuan.tv.data.api.RanNuanApi
 import com.rannuan.tv.ui.screens.category.CategoryScreen
+import com.rannuan.tv.ui.screens.category.prefetchCategoryFirstPages
 import com.rannuan.tv.ui.screens.detail.DetailScreen
 import com.rannuan.tv.ui.screens.home.HomeScreen
 import com.rannuan.tv.ui.screens.player.PlayerScreen
@@ -55,7 +57,7 @@ sealed class Screen(val route: String, val label: String, val icon: ImageVector)
 
 sealed class DetailRoute(val route: String) {
     data object MultiSource : DetailRoute("detail/source/{name}?keys={keys}")
-    data object SingleSource : DetailRoute("detail/{siteKey}/{id}")
+    data object SingleSource : DetailRoute("detail/{siteKey}/{id}?name={name}")
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -70,6 +72,10 @@ fun MainNavHost(api: RanNuanApi) {
     val showBottomBar = currentRoute?.let { route ->
         bottomBarRoutes.any { route.startsWith(it) }
     } ?: false
+
+    LaunchedEffect(Unit) {
+        prefetchCategoryFirstPages(api)
+    }
 
     Scaffold(
         containerColor = Zinc950,
@@ -91,7 +97,6 @@ fun MainNavHost(api: RanNuanApi) {
                             onClick = {
                                 if (selected) return@NavigationBarItem
                                 navController.navigate(screen.route) {
-                                    // 底部 Tab 只恢复到各 Tab 根页面，避免从播放器/详情等深层页面带回失效栈。
                                     popUpTo(navController.graph.startDestinationId) {
                                         saveState = false
                                     }
@@ -149,17 +154,21 @@ fun MainNavHost(api: RanNuanApi) {
                 DetailRoute.SingleSource.route,
                 arguments = listOf(
                     navArgument("siteKey") { type = NavType.StringType },
-                    navArgument("id") { type = NavType.StringType }
+                    navArgument("id") { type = NavType.StringType },
+                    navArgument("name") { type = NavType.StringType; defaultValue = "" }
                 )
             ) { backStackEntry ->
                 val siteKey = backStackEntry.arguments?.getString("siteKey") ?: ""
                 val id = backStackEntry.arguments?.getString("id") ?: ""
+                val name = backStackEntry.arguments?.getString("name") ?: ""
                 DetailScreen(
-                    siteKey = siteKey, id = id,
+                    siteKey = siteKey, id = id, name = name,
                     api = api,
                     onBack = { navController.popBackStack() },
-                    onPlay = { siteKey2, id2, src, ep ->
-                        navController.navigate("player/$siteKey2/$id2?src=$src&ep=$ep")
+                    onPlay = { siteKey2, id2, src, ep, playName, playKeys ->
+                        val encodedName = java.net.URLEncoder.encode(playName, "UTF-8")
+                        val encodedKeys = java.net.URLEncoder.encode(playKeys, "UTF-8")
+                        navController.navigate("player/$siteKey2/$id2?src=$src&ep=$ep&name=$encodedName&keys=$encodedKeys")
                     }
                 )
             }
@@ -176,19 +185,23 @@ fun MainNavHost(api: RanNuanApi) {
                     name = name, keys = keys,
                     api = api,
                     onBack = { navController.popBackStack() },
-                    onPlay = { siteKey2, id2, src, ep ->
-                        navController.navigate("player/$siteKey2/$id2?src=$src&ep=$ep")
+                    onPlay = { siteKey2, id2, src, ep, playName, playKeys ->
+                        val encodedName = java.net.URLEncoder.encode(playName, "UTF-8")
+                        val encodedKeys = java.net.URLEncoder.encode(playKeys, "UTF-8")
+                        navController.navigate("player/$siteKey2/$id2?src=$src&ep=$ep&name=$encodedName&keys=$encodedKeys")
                     }
                 )
             }
             composable(
-                "player/{siteKey}/{id}?src={src}&ep={ep}&pos={pos}",
+                "player/{siteKey}/{id}?src={src}&ep={ep}&pos={pos}&name={name}&keys={keys}",
                 arguments = listOf(
                     navArgument("siteKey") { type = NavType.StringType },
                     navArgument("id") { type = NavType.StringType },
                     navArgument("src") { type = NavType.IntType; defaultValue = 0 },
                     navArgument("ep") { type = NavType.IntType; defaultValue = 0 },
-                    navArgument("pos") { type = NavType.LongType; defaultValue = 0L }
+                    navArgument("pos") { type = NavType.LongType; defaultValue = 0L },
+                    navArgument("name") { type = NavType.StringType; defaultValue = "" },
+                    navArgument("keys") { type = NavType.StringType; defaultValue = "" }
                 )
             ) { backStackEntry ->
                 val siteKey = backStackEntry.arguments?.getString("siteKey") ?: ""
@@ -196,8 +209,11 @@ fun MainNavHost(api: RanNuanApi) {
                 val src = backStackEntry.arguments?.getInt("src") ?: 0
                 val ep = backStackEntry.arguments?.getInt("ep") ?: 0
                 val pos = backStackEntry.arguments?.getLong("pos") ?: 0L
+                val name = backStackEntry.arguments?.getString("name") ?: ""
+                val keys = backStackEntry.arguments?.getString("keys") ?: ""
                 PlayerScreen(
                     siteKey = siteKey, id = id, sourceIdx = src, epIdx = ep, resumePos = pos,
+                    name = name, keys = keys,
                     api = api,
                     onBack = { navController.popBackStack() },
                     onNavigate = { navController.navigate(it) }

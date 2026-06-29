@@ -62,7 +62,7 @@
 - **分类浏览**：POST `/api/category` 按当前页聚合父类+子类 `type_id`，子分类用 `SUB_TYPE_MAP` 精准过滤
 - **名称搜索**：GET `/api/search` 先查缓存/演员索引，再查 CMS 标题关键词，并批量 `detail` 补全演员字段
 - **分页机制**：返回 `{ total, page, pageSize, totalPages, list, complete, outOfRange }`，前端不能完全信任 `totalPages`
-- **首屏体验**：服务端分页缓存 + 客户端有限缓存；不做全量分类拉取，避免 3~4w 条数据进入前端内存
+- **首屏体验**：服务端分页缓存 + `category_cache.json` 磁盘热缓存 + 启动后台预热热门分类首屏；冷启动无缓存时 `/api/category` 先快速返回首屏临时结果，后台补全完整缓存；客户端有限缓存；不做全量分类拉取，避免 3~4w 条数据进入前端内存
 
 ### 2.3 跨站点合并策略
 
@@ -224,11 +224,13 @@ Response: { "total": 520, "page": 1, "pageSize": 30, "totalPages": 18, "list": [
 | monorepo 脚手架 | ✅ | pnpm workspace |
 | server API 网关 | ✅ | 5站点聚合，服务端缓存，分类IDS映射 |
 | shared 共享层 | ✅ | API客户端 + 类型定义 + Zustand Store |
-| 首页 | ✅ | **豆瓣数据驱动**：Banner+5分类+热门推荐全部来自豆瓣API，秒开渲染，点击卡片直跳搜索页 |
+| 首页 | ✅ | **豆瓣数据驱动**：Banner+5分类+热门推荐全部来自豆瓣API，秒开渲染；首页卡片解析后直跳详情，Banner 预解析后播放/详情直达 |
 | 搜索页 | ✅ | SSE流式搜索 + merged合并去重 + 源筛选 + 排序 |
 | **6个分类独立页面** | ✅ | 共用 CategoryPage 组件，子分类支持服务端 type_id 过滤 + 客户端回退 |
 | **分页组件** | ✅ | Pagination（渐进式页码 + 跳页输入 + 每页条数） |
 | **按需分页** | ✅ | 只拉当前请求页，smart预加载后续3页，突破原99页限制 |
+| **分类首屏热缓存** | ✅ | `/api/category` 结果写入 `category_cache.json`，server 启动后恢复并后台预热桌面/移动第一页 |
+| **分类冷启动快速首屏** | ✅ | 无完整缓存时先拉各站主分类/高优先级 type_id，返回 `complete:false` 临时首屏，后台继续刷新完整聚合缓存 |
 | **详情页(多源模式)** | ✅ | 站点选择器 + 播放源标签(中文) + 剧集列表 + keys直拉详情 |
 | 收藏功能 | ✅ | Zustand持久化 + 收藏页面 |
 | **播放器多格式支持** | ✅ | HLS(m3u8) + FLV(flv.js动态加载) + TS(Blob M3U8包装) + Native(mp4/webm) |
@@ -246,7 +248,7 @@ Response: { "total": 520, "page": 1, "pageSize": 30, "totalPages": 18, "list": [
 | **豆瓣图片代理** | ✅ | proxyImg 支持 doubanio.com → `/api/img` + Referer |
 | **分页组件精简** | ✅ | 移除"每页N条"选择器（未接入后端） |
 | **Tauri 桌面包** | ✅ | 自定义标题栏 + 系统托盘 + 后端 sidecar 自动启动 + 关闭隐藏托盘 |
-| **启动动画** | ✅ | 影院风格 SplashScreen：放映机锥形光束 + Logo动画 + 漂浮元素 + Web Audio音效 + 观众席剪影 |
+| **启动动画** | ✅ | 影院风格 SplashScreen：放映机锥形光束 + Logo动画 + 漂浮元素 + Web Audio音效 + 观众席剪影；已在 App 入口重新挂载 |
 | **播放器优化** | ✅ | 全屏去掉返回按钮、音量条显示百分比数值 |
 | 页面keep-alive | ✅ | 模块级globalPageCache + 滚动位置恢复 |
 | 图片懒加载 | ✅ | /api/thumbnail三方案 |
@@ -268,9 +270,8 @@ Response: { "total": 520, "page": 1, "pageSize": 30, "totalPages": 18, "list": [
 
 | # | 问题 | 严重度 | 现象 |
 |---|------|:---:|------|
-| 1 | **分类页首次加载偶发跳过loading** | 🟡 中 | 空缓存 `{list:[], total:0}` 被当作有效缓存，需进一步排查竞态条件 |
-| 2 | **Logo 404** | 🟡 中 | 嵌套路由下 sidebar logo 相对路径解析错误 |
-| 3 | **全屏控制条偶发不响应** | 🟡 中 | 全屏时需 global mousemove 兜底，`onMouseLeave` 已禁用，偶发4s定时器不触发 |
+| 1 | **Logo 404** | 🟡 中 | 嵌套路由下 sidebar logo 相对路径解析错误 |
+| 2 | **全屏控制条偶发不响应** | 🟡 中 | 全屏时需 global mousemove 兜底，`onMouseLeave` 已禁用，偶发4s定时器不触发 |
 
 ---
 
@@ -333,8 +334,9 @@ isLikelyActor(wd)：中文 2~6 字 / 英文全名，排除分类关键词
 - **`ac=videolist` 替代 `ac=list`**：返回完整字段含 vod_actor/vod_pic（参考 MoonTVPlus）
 - **分类拉取**：按子 type_id 并发拉取（非父级type_id，因CMS item挂在子分类下）
 - **按需分页**：POST `/api/category` 只拉取当前请求页 `pg=p`，不再后台预拉全量（突破原99页限制）
-- **智能预加载**：前端自动预取当前页+1/+2/+3 共3页存入 `globalPageCache`，命中缓存直接秒开
-- **加载状态**：首次/翻页无缓存时 `setList([])` 立即清空展示 loading spinner；API 错误独立红色提示+重试按钮；真正无数据才显示"暂无内容"
+- **冷启动快速首屏**：第 1 页无缓存且非子分类时，后端先拉各站主分类/高优先级 type_id，约 3 秒内返回 `complete:false` 临时结果；完整父+子 type_id 聚合在后台刷新并写入缓存
+- **智能预加载**：分类页自动预取当前页+1/+2/+3 共3页存入 `globalPageCache`，首页空闲时预取电影/电视剧/综艺/动漫首屏，命中缓存直接秒开
+- **加载状态**：首次/翻页无缓存时展示 loading；若拿到 `complete:false` 临时结果则先展示列表、不固化缓存，数秒后静默刷新完整结果；API 错误独立红色提示+重试按钮；真正无数据才显示"暂无内容"
 
 ### 7.3 跨站点合并去重
 
@@ -485,6 +487,8 @@ RanNuan TV.exe 启动
 | 音效（Web Audio） | 放映机低频嗡鸣 + 胶卷咔哒三连击 + 开场钟声渐弱 |
 | 消退 | 3 秒后淡出进入首页 |
 
+**入口挂载说明**：`apps/desktop/src/App.tsx` 通过 `showSplash` 状态挂载 `SplashScreen`，`onFinish` 后卸载。该动画是前端覆盖层，不阻塞后端 sidecar 启动；分类后端预热仍由 `server/server.js` 在监听成功后后台执行。
+
 **Tauri 关键配置** (`src-tauri/`)：
 
 | 文件 | 作用 |
@@ -599,6 +603,7 @@ setResults(prev => dedupClientSide([...prev, ...videos]));
 | **搜索列表需 detail 补全演员字段** | 部分资源站 `videolist/list` 不稳定返回 `vod_actor`，片名搜索结果应批量 `ac=detail&ids=` 补全后写入演员索引 |
 | **演员索引不能无限膨胀** | `actor_index.json` 已可能达到数百 MB，索引只保存搜索卡片字段，不保存 `vod_content`，每演员最多 200 条 |
 | **共享后端影响两端** | `server/server.js` 同时服务桌面端和 Android；改 `/api/search`、`/api/category`、`/api/multi-detail` 必须同时考虑两端调用契约 |
+| **分类冷启动不能等完整聚合** | 电影/电视剧要跨 5 站拉父类+多个子类 type_id，冷启动完整聚合可能 10s+；首屏应快速返回部分高质量结果，再后台补完整缓存 |
 | **父分类分页不完全可信** | 文档中父类 `t=1/t=2` 理论支持全类分页，但部分资源站返回 `pagecount`/数据不稳定；全部分类仍用父+子 type_id 聚合保证翻页 |
 | **移动端缓存必须有限** | Android 端只缓存最近分页/搜索/详情，不能缓存整分类；电影/电视剧可达 3~4w 条，整类内存缓存会导致 OOM 风险 |
 | **索尼编号不标准** | suoni 电视剧(14=欧美/17=港剧)、综艺(26↔27)、动漫(32→44)均与标准 MACCMS 不同，需单独映射 |
@@ -651,14 +656,14 @@ GET /api/douban/home（一次请求）
     ↓
 首页秒开渲染豆瓣卡片（海报+⭐评分+标题+年份）
   → Banner：前5条 → MediaItem映射，轮播展示
-  → 卡片点击 → navigate(/search?wd=标题) 直跳搜索页（瞬时响应）
-  → Banner播放 → searchMedia → 直接跳播放器
+  → 首页卡片 hover/focus 预解析 CMS 资源，点击命中后直跳详情页
+  → Banner 前4条后台预解析，播放/详情点击优先复用缓存直达
 ```
 
 **关键设计决策**：
 - ❌ 不在首页预匹配 CMS（KVideo/MoonTVPlus 同理，避免白屏 5-10s）
 - ✅ 首页纯豆瓣元数据，0.2-0.5s 秒开
-- ✅ 客户端名称匹配已移除，点击直跳搜索页（搜索页自有缓存+并行搜索）
+- ✅ 客户端首页点击不再直跳搜索页：先复用预解析结果进详情页，未命中才兜底搜索
 - ✅ 豆瓣图片走 `/api/img` 代理 + Referer 头解决防盗链
 - ✅ 内存缓存 TTL 10 分钟，过期自动刷新
 
@@ -666,7 +671,33 @@ GET /api/douban/home（一次请求）
 
 ---
 
+### 7.10 分类首屏快速返回架构
 
-> 📅 文档版本：v5.6
-> 📝 最后更新：2026-06-16（新增 NSIS 打包踩坑、CMD 隐藏、图标缓存）
+**目标**：解决桌面端/移动端首次进入分类时，完整多站多 type_id 聚合导致的 10s+ 等待。
+
+```
+POST /api/category { category, page: 1, pageSize, subType: undefined }
+  ├─ 命中完整缓存 → 直接返回 complete:true
+  ├─ 后台完整刷新正在进行 → 最多等待约 2.5s，完成则返回完整缓存
+  └─ 无缓存/未完成 → 快速首屏路径
+      ├─ 每个资源站只拉 root type_id + 2 个高优先级 type_id
+      ├─ 约 3.2s 内合并去重后返回 complete:false, warming:true
+      └─ startCategoryFullRefresh() 后台执行完整父+子 type_id 聚合
+          → 写入内存缓存 + category_cache.json
+```
+
+**前端处理**：
+- `CategoryPage` 收到 `complete:false` 时先展示列表，但不写入 `globalPageCache`。
+- 约 6.5 秒后保留当前列表静默再请求一次；如果后台完整缓存已生成，则替换成 `complete:true` 完整结果。
+- 首页加载完成后延迟预取 `movie/tv/variety/anime` 首屏，用户点分类时更容易命中缓存。
+
+**兼容性**：
+- 子分类、非首页分页、`refresh:true` 仍走完整聚合路径。
+- 响应仅新增 `warming:true` 和 `complete:false` 的临时状态；移动端如果暂未特殊处理，也能正常展示 `list`。
+
+---
+
+
+> 📅 文档版本：v5.8
+> 📝 最后更新：2026-06-29（分类冷启动快速首屏、后台完整缓存刷新、桌面启动动画恢复挂载）
 > 👤 作者：RanNuan TV 开发团队

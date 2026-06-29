@@ -5,3 +5,4 @@ target/
 .DS_Store
 Thumbs.db
 db.json
+category_cache.json

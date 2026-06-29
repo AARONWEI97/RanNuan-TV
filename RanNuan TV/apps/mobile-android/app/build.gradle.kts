@@ -18,7 +18,7 @@ android {
         // 模拟器默认：http://10.0.2.2:3000（10.0.2.2 = 宿主机 localhost）
         // 真机打包：gradlew :app:installDebug -PserverUrl="http://你的IP:3000"
         buildConfigField("String", "SERVER_URL",
-            "\"${project.findProperty("serverUrl") ?: "http://192.168.1.7:3000"}\"")
+            "\"${project.findProperty("serverUrl") ?: "http://47.108.80.234:3000"}\"")
     }
 
     buildFeatures {

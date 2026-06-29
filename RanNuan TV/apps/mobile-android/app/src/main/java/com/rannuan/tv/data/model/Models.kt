@@ -68,6 +68,7 @@ data class CategoryResponse(
     val totalPages: Int = 0,
     val list: List<MediaItem> = emptyList(),
     val complete: Boolean = false,
+    val warming: Boolean = false,
     val outOfRange: Boolean = false,
     val serverFiltered: Boolean = false,
     val subCounts: Map<String, Int>? = null

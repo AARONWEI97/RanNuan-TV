@@ -16,6 +16,7 @@ function proxyImg(rawUrl: string): string {
 export default function DetailPage() {
   const { siteKey, id, name } = useParams<{ siteKey?: string; id?: string; name?: string }>();
   const [searchParams] = useSearchParams();
+  const detailKeys = searchParams.get('keys') || undefined;
   const navigate = useNavigate();
   const { isFavorite, addToFavorites, removeFromFavorites } = useFavoriteStore();
 
@@ -28,24 +29,34 @@ export default function DetailPage() {
   const [loading, setLoading] = useState(true);
   const [sourceIdx, setSourceIdx] = useState(0);
   const [episodeFilter, setEpisodeFilter] = useState('');
+  const [episodeRange, setEpisodeRange] = useState(0);
 
   const isMultiMode = !!name;
 
   // ---- 数据加载 ----
   useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setDetail(null);
+    setMultiDetails([]);
+    setActiveSiteIdx(0);
+    setSourceIdx(0);
+    setEpisodeFilter('');
+    setEpisodeRange(0);
+
     if (isMultiMode && name) {
-      const keys = searchParams.get('keys') || undefined;
-      getMultiDetail(decodeURIComponent(name), keys)
-        .then(setMultiDetails)
-        .finally(() => setLoading(false));
+      getMultiDetail(decodeURIComponent(name), detailKeys)
+        .then(data => { if (!cancelled) setMultiDetails(data); })
+        .finally(() => { if (!cancelled) setLoading(false); });
     } else if (siteKey && id) {
       getDetail(siteKey, id)
-        .then(setDetail)
-        .finally(() => setLoading(false));
+        .then(data => { if (!cancelled) setDetail(data); })
+        .finally(() => { if (!cancelled) setLoading(false); });
     } else {
       setLoading(false);
     }
-  }, [siteKey, id, name, isMultiMode]);
+    return () => { cancelled = true; };
+  }, [siteKey, id, name, isMultiMode, detailKeys]);
 
   // ---- 当前显示的详情 ----
   const currentDetail: MediaDetail | null = isMultiMode
@@ -80,9 +91,26 @@ export default function DetailPage() {
 
   const filteredEpisodes = useMemo(() => {
     if (!currentSource) return [];
-    if (!episodeFilter.trim()) return currentSource.episodes;
+    if (!episodeFilter.trim()) {
+      if (currentSource.episodes.length <= 60) return currentSource.episodes;
+      return currentSource.episodes.slice(episodeRange, episodeRange + 60);
+    }
     return currentSource.episodes.filter(ep => ep.title.includes(episodeFilter.trim()));
-  }, [currentSource, episodeFilter]);
+  }, [currentSource, episodeFilter, episodeRange]);
+
+  const episodeRanges = useMemo(() => {
+    if (!currentSource || currentSource.episodes.length <= 60) return [];
+    const ranges: { start: number; end: number; label: string }[] = [];
+    for (let start = 0; start < currentSource.episodes.length; start += 60) {
+      const end = Math.min(start + 60, currentSource.episodes.length);
+      ranges.push({ start, end, label: `${start + 1}-${end}` });
+    }
+    return ranges;
+  }, [currentSource]);
+
+  useEffect(() => {
+    setEpisodeRange(0);
+  }, [sourceIdx, activeSiteIdx, currentDetail?.vod_id]);
 
   const realId = isMultiMode && multiDetails[activeSiteIdx]
     ? multiDetails[activeSiteIdx].vod_id
@@ -225,7 +253,7 @@ export default function DetailPage() {
               {multiDetails.map((md, i) => (
                 <button
                   key={md.site_key}
-                  onClick={() => { setActiveSiteIdx(i); setSourceIdx(0); setEpisodeFilter(''); }}
+                  onClick={() => { setActiveSiteIdx(i); setSourceIdx(0); setEpisodeFilter(''); setEpisodeRange(0); }}
                   className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
                     i === activeSiteIdx
                       ? 'bg-brand-500 text-white shadow-lg shadow-brand-500/25'
@@ -244,7 +272,7 @@ export default function DetailPage() {
               {sources.map((s, i) => (
                 <button
                   key={i}
-                  onClick={() => { setSourceIdx(i); setEpisodeFilter(''); }}
+                  onClick={() => { setSourceIdx(i); setEpisodeFilter(''); setEpisodeRange(0); }}
                   className={`px-4 py-1.5 rounded-lg text-sm transition-colors ${
                     i === sourceIdx
                       ? 'bg-brand-500 text-white'
@@ -278,6 +306,23 @@ export default function DetailPage() {
                   </div>
                 )}
               </div>
+              {episodeRanges.length > 0 && !episodeFilter.trim() && (
+                <div className="flex gap-2 mb-3 overflow-x-auto custom-scrollbar pb-1">
+                  {episodeRanges.map(range => (
+                    <button
+                      key={range.start}
+                      onClick={() => setEpisodeRange(range.start)}
+                      className={`px-3 py-1 rounded-lg text-xs whitespace-nowrap transition-colors ${
+                        episodeRange === range.start
+                          ? 'bg-brand-500 text-white'
+                          : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200'
+                      }`}
+                    >
+                      {range.label}
+                    </button>
+                  ))}
+                </div>
+              )}
               <div className="flex flex-wrap gap-2 max-h-64 overflow-y-auto p-1">
                 {filteredEpisodes.length > 0 ? (
                   filteredEpisodes.map((ep, idx) => {

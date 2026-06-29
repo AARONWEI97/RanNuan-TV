@@ -12,6 +12,7 @@ const DATA_FILE = path.join(__dirname, 'db.json');
 const ADMIN_PASSWORD = "admin"; 
 const FORCE_UPDATE = true; 
 const ACTOR_INDEX_FILE = path.join(__dirname, 'actor_index.json'); 
+const CATEGORY_CACHE_FILE = path.join(__dirname, 'category_cache.json');
 
 app.use(cors());
 app.use(bodyParser.json());
@@ -100,6 +101,12 @@ const ACTOR_SCAN_PAGES = 2;
 const ACTOR_SCAN_TYPE_IDS_PER_CATEGORY = 2;
 const ACTOR_SCAN_DETAIL_LIMIT_PER_PAGE = 18;
 const CATEGORY_CACHE_VERSION = 'v2';
+const CATEGORY_DISK_CACHE_TTL = 24 * 60 * 60 * 1000;
+const CATEGORY_PREWARM_CATEGORIES = ['movie', 'tv', 'variety', 'anime', 'shortDrama', 'sports'];
+const CATEGORY_PREWARM_PAGE_SIZES = [30, 20];
+const CATEGORY_FAST_FIRST_PAGE_TIMEOUT = 3200;
+let categoryCacheSaveTimer = null;
+const categoryFullRefreshInFlight = new Map();
 
 // ---- 已知站点的分类 type_id 映射（父级 + 子级） ----
 // ⚠️ CMS item 挂在子分类下（动作片=6），不是父级（电影片=1），
@@ -140,7 +147,7 @@ const SITE_TYPE_IDS = {
     variety:    [3, 25,26,27,28],
     anime:      [4, 29,30,31,32,33],
     shortDrama: [46],
-    sports:     [36],
+    sports:     [],
   },
   bfzy: {
     movie:      [20, 21,22,23,24,25,26,27,28,29,50],
@@ -159,7 +166,7 @@ const SITE_ROOT_TYPE_IDS = {
   lzzy:  { movie: 1,  tv: 2,  variety: 3,  anime: 4,  shortDrama: 46, sports: 36 },
   ffzy:  { movie: 1,  tv: 2,  variety: 3,  anime: 4,  shortDrama: 36 },
   suoni: { movie: 1,  tv: 2,  variety: 3,  anime: 4,  shortDrama: 46, sports: 48 },
-  bdzy:  { movie: 1,  tv: 2,  variety: 3,  anime: 4,  shortDrama: 46, sports: 36 },
+  bdzy:  { movie: 1,  tv: 2,  variety: 3,  anime: 4,  shortDrama: 46 },
   bfzy:  { movie: 20, tv: 30, variety: 45, anime: 39, shortDrama: 58, sports: 53 },
 };
 // 分类名到站点 type_name 的映射（用于动态发现其他站点）
@@ -258,11 +265,14 @@ async function batchLimit(tasks, limit = 5) {
 
 /** 兜底扫描优先使用的 type_id（常见大分类，非父级 id） */
 function getPriorityScanTypeIds(siteKey, category) {
-  const PRIORITY = {
+    const PRIORITY = {
     movie:  { lzzy: [6,7,8,10,11,9,12], ffzy: [6,7,8,10,11,9,12], suoni: [6,7,8,10,11,9,12], bdzy: [6,7,8,10,11,9,12], bfzy: [21,22,25,26,23,24,27] },
     tv:     { lzzy: [13,15,16,14,21,22], ffzy: [13,15,16,14,21,22], suoni: [13,15,16,14,21,22], bdzy: [13,15,16,14,21,22], bfzy: [31,34,32,33,35,36] },
-  };
-  return PRIORITY[category]?.[siteKey] || [];
+    variety:{ lzzy: [25,26,27,28], ffzy: [25,26,27,28], suoni: [25,26,27,28], bdzy: [25,26,27,28], bfzy: [46,47,48,49] },
+    anime:  { lzzy: [29,30,31,32,33], ffzy: [29,30,31,32,33], suoni: [29,30,31,44,45], bdzy: [29,30,31,32,33], bfzy: [40,41,42,43,44] },
+    sports: { lzzy: [37,38,39,40], ffzy: [], suoni: [49,50,52], bdzy: [], bfzy: [54,55,56,57] },
+    };
+    return PRIORITY[category]?.[siteKey] || [];
 }
 // 站点 class 列表缓存（key = site.key）
 const siteClassCache = new Map();
@@ -305,6 +315,7 @@ function getCachedEntry(key) {
 }
 function setCache(key, data, ttl) {
     serverCache.set(key, { data, time: Date.now(), ttl, complete: true });
+    if (isCategoryPageCacheKey(key)) scheduleCategoryCacheSave();
     cleanCache();
 }
 /** 设置不完整缓存（后台还在拉取中） */
@@ -324,9 +335,48 @@ function cleanCache() {
     }
 }
 
+function buildCategoryMetaKey(categoryOrWd, sub) {
+    const subLabel = sub ? `:${sub}` : '';
+    return `${CATEGORY_CACHE_VERSION}:category-meta:${categoryOrWd}${subLabel}`;
+}
+
+function buildCategoryPageCacheKey(categoryOrWd, sub, page, pageSize) {
+    const subLabel = sub ? `:${sub}` : '';
+    return `${CATEGORY_CACHE_VERSION}:category:${categoryOrWd}${subLabel}:${page}:${pageSize}`;
+}
+
+function isCategoryPageCacheKey(key) {
+    return typeof key === 'string' && key.startsWith(`${CATEGORY_CACHE_VERSION}:category:`);
+}
+
+function withTimeout(promise, timeoutMs, fallbackValue) {
+    let timer = null;
+    const timeout = new Promise(resolve => {
+        timer = setTimeout(() => resolve(fallbackValue), timeoutMs);
+    });
+    return Promise.race([promise, timeout]).finally(() => {
+        if (timer) clearTimeout(timer);
+    });
+}
+
+function scheduleCategoryCacheSave() {
+    if (categoryCacheSaveTimer) return;
+    categoryCacheSaveTimer = setTimeout(() => {
+        categoryCacheSaveTimer = null;
+        saveCategoryCacheToDisk();
+    }, 1200);
+    if (categoryCacheSaveTimer.unref) categoryCacheSaveTimer.unref();
+}
+
 function getWorkingSites() {
-    const all = getDB().sites.filter(s => s.active);
-    return all.filter(s => WORKING_SITES.includes(s.key));
+  const all = getDB().sites.filter(s => s.active);
+  return all.filter(s => WORKING_SITES.includes(s.key));
+}
+
+function getFastCategoryTypeIds(siteKey, category) {
+    const rootId = SITE_ROOT_TYPE_IDS[siteKey]?.[category];
+    const priorityIds = getPriorityScanTypeIds(siteKey, category).slice(0, 2);
+    return [...new Set([rootId, ...priorityIds].filter(Boolean))];
 }
 
 function normalizeSearchKeyword(wd) {
@@ -1109,8 +1159,168 @@ app.get('/api/multi-detail', async (req, res) => {
 // 分类元数据缓存：第1页扫描后记录 maxPage / total，供后续翻页复用
 const categoryMetaCache = new Map();
 
+function saveCategoryCacheToDisk() {
+    try {
+        const pages = {};
+        for (const [key, entry] of serverCache.entries()) {
+            if (!isCategoryPageCacheKey(key)) continue;
+            if (!entry.complete || !entry.data?.list?.length) continue;
+            if (Date.now() - entry.time > CATEGORY_DISK_CACHE_TTL) continue;
+            pages[key] = {
+                data: entry.data,
+                time: entry.time,
+                ttl: CATEGORY_DISK_CACHE_TTL,
+                complete: true,
+            };
+        }
+        const meta = Object.fromEntries(categoryMetaCache.entries());
+        fs.writeFileSync(
+            CATEGORY_CACHE_FILE,
+            JSON.stringify({ version: CATEGORY_CACHE_VERSION, savedAt: Date.now(), pages, meta }, null, 2)
+        );
+    } catch (e) {
+        console.log('[CategoryCache] 保存失败:', e.message);
+    }
+}
+
+function loadCategoryCacheFromDisk() {
+    try {
+        if (!fs.existsSync(CATEGORY_CACHE_FILE)) return;
+        const raw = JSON.parse(fs.readFileSync(CATEGORY_CACHE_FILE, 'utf8'));
+        if (raw.version !== CATEGORY_CACHE_VERSION) return;
+        let restoredPages = 0;
+        const now = Date.now();
+        for (const [key, entry] of Object.entries(raw.pages || {})) {
+            if (!isCategoryPageCacheKey(key)) continue;
+            if (!entry?.data?.list?.length) continue;
+            if (now - (entry.time || raw.savedAt || 0) > CATEGORY_DISK_CACHE_TTL) continue;
+            serverCache.set(key, {
+                data: entry.data,
+                time: entry.time || raw.savedAt || now,
+                ttl: CATEGORY_DISK_CACHE_TTL,
+                complete: true,
+            });
+            restoredPages++;
+        }
+        for (const [key, value] of Object.entries(raw.meta || {})) {
+            if (key.startsWith(`${CATEGORY_CACHE_VERSION}:category-meta:`)) categoryMetaCache.set(key, value);
+        }
+        if (restoredPages > 0) console.log(`[CategoryCache] 从磁盘恢复 ${restoredPages} 个分类页缓存`);
+    } catch (e) {
+        console.log('[CategoryCache] 恢复失败:', e.message);
+    }
+}
+
+function startCategoryPrewarm() {
+    const tasks = [];
+    for (const category of CATEGORY_PREWARM_CATEGORIES) {
+        for (const pageSize of CATEGORY_PREWARM_PAGE_SIZES) {
+            tasks.push({ category, pageSize });
+        }
+    }
+
+    (async () => {
+        await new Promise(resolve => setTimeout(resolve, 2500));
+        console.log(`[CategoryWarmup] 开始后台预热 ${tasks.length} 个分类首屏`);
+        for (const task of tasks) {
+            const key = buildCategoryPageCacheKey(task.category, null, 1, task.pageSize);
+            const cached = getCachedEntry(key);
+            const freshEnough = cached && cached.complete && Date.now() - cached.time < CACHE_TTL.category;
+            if (freshEnough) continue;
+            try {
+                await startCategoryFullRefresh({
+                    category: task.category,
+                    page: 1,
+                    pageSize: task.pageSize,
+                }, key);
+                console.log(`[CategoryWarmup] ${task.category} pageSize=${task.pageSize} 完成`);
+            } catch (e) {
+                console.log(`[CategoryWarmup] ${task.category} pageSize=${task.pageSize} 跳过: ${e.message}`);
+            }
+            await new Promise(resolve => setTimeout(resolve, 600));
+        }
+        saveCategoryCacheToDisk();
+        console.log('[CategoryWarmup] 后台预热结束');
+    })();
+}
+
+async function fetchFastCategoryFirstPage({ category, fallbackWd, pageSize, metaKey }) {
+    const sites = getWorkingSites();
+    const allResults = [];
+    let maxPage = 1;
+    let servedRequest = false;
+
+    await Promise.all(sites.map(async (site) => {
+        const typeIds = getFastCategoryTypeIds(site.key, category);
+        const siteItems = [];
+
+        const tasks = typeIds.length > 0
+            ? typeIds.map(tid => async () => {
+                try {
+                    const url = `${site.api}?ac=videolist&t=${tid}&pg=1&out=json`;
+                    const r = await axios.get(url, { timeout: 2600 });
+                    const list = r.data.list || r.data.data || [];
+                    if (!Array.isArray(list) || list.length === 0) return [];
+                    servedRequest = true;
+                    const pc = Number(r.data.pagecount) || 1;
+                    maxPage = Math.max(maxPage, pc);
+                    return list.map(item => ({ ...item, site_key: site.key, site_name: site.name, latency: 0 }));
+                } catch { return []; }
+            })
+            : [async () => {
+                try {
+                    const url = `${site.api}?ac=videolist&wd=${encodeURIComponent(fallbackWd)}&pg=1&out=json`;
+                    const r = await axios.get(url, { timeout: 2600 });
+                    const list = r.data.list || r.data.data || [];
+                    if (!Array.isArray(list) || list.length === 0) return [];
+                    servedRequest = true;
+                    const pc = Number(r.data.pagecount) || 1;
+                    maxPage = Math.max(maxPage, pc);
+                    return list.map(item => ({ ...item, site_key: site.key, site_name: site.name, latency: 0 }));
+                } catch { return []; }
+            }];
+
+        const results = await batchLimit(tasks, 2);
+        for (const items of results) {
+            if (items && items.length > 0) siteItems.push(...items);
+        }
+        crossSiteImagePicks(siteItems).forEach(item => allResults.push(item));
+    }));
+
+    const merged = crossSiteImagePicks(allResults);
+    if (!servedRequest || merged.length === 0) return null;
+
+    const totalEstimate = maxPage * pageSize;
+    const existingMeta = categoryMetaCache.get(metaKey) || {};
+    categoryMetaCache.set(metaKey, { ...existingMeta, maxPage, total: totalEstimate });
+
+    return {
+        total: totalEstimate || merged.length,
+        page: 1,
+        pageSize,
+        totalPages: Math.max(1, maxPage),
+        list: merged.slice(0, pageSize),
+        complete: false,
+        warming: true,
+        serverFiltered: false,
+        subCounts: existingMeta.subCounts || undefined,
+    };
+}
+
+function startCategoryFullRefresh(payload, cacheKey) {
+    if (categoryFullRefreshInFlight.has(cacheKey)) return categoryFullRefreshInFlight.get(cacheKey);
+    const promise = axios.post(`http://127.0.0.1:${PORT}/api/category`, {
+        ...payload,
+        refresh: true,
+    }, { timeout: 45000 })
+        .catch(e => console.log(`[Category] 后台完整缓存失败 ${cacheKey}: ${e.message}`))
+        .finally(() => categoryFullRefreshInFlight.delete(cacheKey));
+    categoryFullRefreshInFlight.set(cacheKey, promise);
+    return promise;
+}
+
 app.post('/api/category', async (req, res) => {
-    const { category, wd, subType, page = 1, pageSize = 30 } = req.body;
+    const { category, wd, subType, page = 1, pageSize = 30, refresh = false } = req.body;
     const fallbackWd = wd || (category ? CATEGORY_TYPE_NAMES[category]?.[0] : null);
     if (!fallbackWd && !category) return res.status(400).json({ error: 'Missing category or wd' });
 
@@ -1118,11 +1328,12 @@ app.post('/api/category', async (req, res) => {
     const ps = Number(pageSize);
     const sub = subType || null;
     const subLabel = sub ? `:${sub}` : '';
-    const metaKey = `${CATEGORY_CACHE_VERSION}:category-meta:${category || wd}${subLabel}`;
-    const cacheKey = `${CATEGORY_CACHE_VERSION}:category:${category || wd}${subLabel}:${p}`;
+    const categoryOrWd = category || wd;
+    const metaKey = buildCategoryMetaKey(categoryOrWd, sub);
+    const cacheKey = buildCategoryPageCacheKey(categoryOrWd, sub, p, ps);
 
     const cached = getCachedEntry(cacheKey);
-    if (cached && cached.complete) {
+    if (cached && cached.complete && !refresh) {
         // 缓存命中时，从 metaCache 补上 subCounts（异步写入的，不在 page 缓存里）
         const meta = categoryMetaCache.get(metaKey);
         const data = meta?.subCounts ? { ...cached.data, subCounts: meta.subCounts } : cached.data;
@@ -1132,6 +1343,32 @@ app.post('/api/category', async (req, res) => {
     const meta = categoryMetaCache.get(metaKey);
     if (meta && p > meta.maxPage) {
         return res.json({ total: meta.total, page: p, pageSize: ps, totalPages: meta.maxPage, list: [], complete: true, outOfRange: true, subCounts: meta.subCounts });
+    }
+
+    const fullRefresh = categoryFullRefreshInFlight.get(cacheKey);
+    if (!refresh && fullRefresh) {
+        await withTimeout(fullRefresh, 2500, null);
+        const refreshed = getCachedEntry(cacheKey);
+        if (refreshed && refreshed.complete) {
+            const refreshedMeta = categoryMetaCache.get(metaKey);
+            const data = refreshedMeta?.subCounts ? { ...refreshed.data, subCounts: refreshedMeta.subCounts } : refreshed.data;
+            return res.json(data);
+        }
+        if (refreshed?.data?.list?.length) return res.json(refreshed.data);
+    }
+
+    if (!refresh && category && !sub && p === 1) {
+        const fastResult = await withTimeout(
+            fetchFastCategoryFirstPage({ category, fallbackWd, pageSize: ps, metaKey }),
+            CATEGORY_FAST_FIRST_PAGE_TIMEOUT,
+            null
+        );
+        if (fastResult?.list?.length) {
+            setCachePartial(cacheKey, fastResult, Math.min(CACHE_TTL.category, 90 * 1000));
+            startCategoryFullRefresh({ category, wd: fallbackWd, page: p, pageSize: ps, subType: undefined }, cacheKey);
+            console.log(`[Category] "${category}" 首屏快速返回 ${fastResult.list.length} 条，完整缓存后台刷新中`);
+            return res.json(fastResult);
+        }
     }
 
     // === 子分类 type_id 解析 ===
@@ -1594,19 +1831,25 @@ app.post('/api/actor-index/save', (req, res) => {
 // ==================== 启动初始化 ====================
 // 1. 从磁盘恢复演员索引
 loadFromDisk(ACTOR_INDEX_FILE);
+loadCategoryCacheFromDisk();
 
 // 2. 定期自动保存索引（每 10 分钟）
-const autoSaveInterval = setInterval(() => { saveToDisk(ACTOR_INDEX_FILE); }, 10 * 60 * 1000);
+const autoSaveInterval = setInterval(() => {
+    saveToDisk(ACTOR_INDEX_FILE);
+    saveCategoryCacheToDisk();
+}, 10 * 60 * 1000);
 
 // 3. 退出时保存索引
 process.on('SIGINT', () => {
     console.log('\n[ActorIndex] 正在保存索引...');
     saveToDisk(ACTOR_INDEX_FILE);
+    saveCategoryCacheToDisk();
     clearInterval(autoSaveInterval);
     process.exit(0);
 });
 process.on('SIGTERM', () => {
     saveToDisk(ACTOR_INDEX_FILE);
+    saveCategoryCacheToDisk();
     clearInterval(autoSaveInterval);
     process.exit(0);
 });
@@ -1633,4 +1876,5 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`服务已启动: http://localhost:${PORT}`);
   console.log(`  桌面/浏览器访问: http://localhost:${PORT}`);
   console.log(`  Android 模拟器访问: http://10.0.2.2:${PORT}/mobile`);
+  startCategoryPrewarm();
 });

@@ -1,9 +1,10 @@
-import { useState, useEffect, useMemo, useCallback, type ReactNode } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { getDoubanHome, searchMedia } from 'shared';
+import { getCategory, getDoubanHome, searchMedia } from 'shared';
 import type { MediaItem, DoubanSubject, DoubanHomeData } from 'shared';
 import Banner from '../components/media/Banner';
 import { proxyImg } from '../utils/imageProxy';
+import { detailLink } from '../utils/navigate';
 
 const sections: { key: keyof DoubanHomeData; label: string; icon: string; path: string; count: number }[] = [
   { key: 'dianshiju', label: '电视剧', icon: '📺', path: '/tv', count: 12 },
@@ -16,6 +17,8 @@ export default function HomePage() {
   const [doubanData, setDoubanData] = useState<DoubanHomeData | null>(null);
   const [loading, setLoading] = useState(true);
   const navigate = useNavigate();
+  const homeResolveCache = useRef<Map<string, Promise<MediaItem[]>>>(new Map());
+  const homeResolvedTargets = useRef<Map<string, MediaItem[]>>(new Map());
 
   useEffect(() => {
     getDoubanHome()
@@ -24,10 +27,43 @@ export default function HomePage() {
       .finally(() => setLoading(false));
   }, []);
 
-  // 点击豆瓣卡片 → 直接跳搜索页（搜索页有缓存，秒开）
+  const resolveHomeTarget = useCallback((title: string) => {
+    const key = title.trim();
+    if (!key) return Promise.resolve([] as MediaItem[]);
+    const cached = homeResolveCache.current.get(key);
+    if (cached) return cached;
+
+    const pending = searchMedia(key)
+      .then(results => {
+        const list = results || [];
+        homeResolvedTargets.current.set(key, list);
+        return list;
+      })
+      .catch(() => []);
+    homeResolveCache.current.set(key, pending);
+    return pending;
+  }, []);
+
+  const sourceDetailPath = useCallback((title: string) => (
+    `/detail/source/${encodeURIComponent(title.trim())}`
+  ), []);
+
+  const getResolvedTarget = useCallback((title: string) => {
+    return homeResolvedTargets.current.get(title.trim()) || null;
+  }, []);
+
+  // 点击豆瓣卡片：已有预解析缓存就直达具体详情；无缓存时立刻进详情加载页，不在首页等待搜索完成。
   const handleClick = useCallback((title: string) => {
-    navigate(`/search?wd=${encodeURIComponent(title)}`);
-  }, [navigate]);
+    const key = title.trim();
+    if (!key) return;
+    const resolved = getResolvedTarget(key);
+    if (resolved?.length) {
+      navigate(detailLink(resolved[0]));
+      return;
+    }
+    void resolveHomeTarget(key);
+    navigate(sourceDetailPath(key));
+  }, [getResolvedTarget, navigate, resolveHomeTarget, sourceDetailPath]);
 
   // 豆瓣数据 → MediaItem 映射（供 Banner 使用）
   const bannerItems = useMemo<MediaItem[]>(() =>
@@ -47,22 +83,46 @@ export default function HomePage() {
     } as MediaItem)),
   [doubanData]);
 
-  // Banner 回调（依赖稳定，用 useCallback）
-  const handleBannerPlay = useCallback(async (item: MediaItem) => {
-    try {
-      const results = await searchMedia(item.vod_name);
-      if (results.length > 0) navigate(`/player/${results[0].site_key}/${results[0].vod_id}`);
-      else navigate(`/search?wd=${encodeURIComponent(item.vod_name)}`);
-    } catch { navigate(`/search?wd=${encodeURIComponent(item.vod_name)}`); }
-  }, [navigate]);
+  useEffect(() => {
+    if (!bannerItems.length) return;
+    const targets = bannerItems.slice(0, 4);
+    targets.forEach(item => {
+      if (item.vod_name) void resolveHomeTarget(item.vod_name);
+    });
+  }, [bannerItems, resolveHomeTarget]);
 
-  const handleBannerDetail = useCallback(async (item: MediaItem) => {
-    try {
-      const results = await searchMedia(item.vod_name);
-      if (results.length > 0) navigate(`/detail/${results[0].site_key}/${results[0].vod_id}`);
-      else navigate(`/search?wd=${encodeURIComponent(item.vod_name)}`);
-    } catch { navigate(`/search?wd=${encodeURIComponent(item.vod_name)}`); }
-  }, [navigate]);
+  useEffect(() => {
+    if (loading) return;
+    const timer = window.setTimeout(() => {
+      const prefetchList = [
+        ['movie', '电影'],
+        ['tv', '电视剧'],
+        ['variety', '综艺'],
+        ['anime', '动漫'],
+      ] as const;
+      prefetchList.forEach(([category, fallback]) => {
+        void getCategory(category, fallback, 1, 30).catch(() => {});
+      });
+    }, 900);
+    return () => window.clearTimeout(timer);
+  }, [loading]);
+
+  // Banner 回调（依赖稳定，用 useCallback）
+  const handleBannerPlay = useCallback((item: MediaItem) => {
+    const key = item.vod_name.trim();
+    if (!key) return;
+    const resolved = getResolvedTarget(key);
+    if (resolved?.length) {
+      navigate(`/player/${resolved[0].site_key}/${resolved[0].vod_id}`);
+      return;
+    }
+    void resolveHomeTarget(key);
+    navigate(sourceDetailPath(key));
+  }, [getResolvedTarget, navigate, resolveHomeTarget, sourceDetailPath]);
+
+  const handleBannerDetail = useCallback((item: MediaItem) => {
+    handleClick(item.vod_name);
+  }, [handleClick]);
 
   // Loading骨架屏
   if (loading) {
@@ -110,7 +170,7 @@ export default function HomePage() {
 
       {/* 热门推荐 */}
       <Section title="热门推荐" icon="🔥" moreLink="/movie" delay={0}>
-        <DoubanGrid items={doubanData.hot.slice(0, 18)} onClick={handleClick} />
+        <DoubanGrid items={doubanData.hot.slice(0, 18)} onClick={handleClick} onPreview={resolveHomeTarget} />
       </Section>
 
       {/* 各分类 */}
@@ -119,7 +179,7 @@ export default function HomePage() {
         if (!items.length) return null;
         return (
           <Section key={section.key} title={section.label} icon={section.icon} moreLink={section.path} delay={idx + 1}>
-            <DoubanGrid items={items.slice(0, section.count)} onClick={handleClick} />
+            <DoubanGrid items={items.slice(0, section.count)} onClick={handleClick} onPreview={resolveHomeTarget} />
           </Section>
         );
       })}
@@ -128,7 +188,15 @@ export default function HomePage() {
 }
 
 /** 豆瓣海报网格 */
-function DoubanGrid({ items, onClick }: { items: DoubanSubject[]; onClick: (title: string) => void }) {
+function DoubanGrid({
+  items,
+  onClick,
+  onPreview,
+}: {
+  items: DoubanSubject[];
+  onClick: (title: string) => void;
+  onPreview: (title: string) => Promise<MediaItem[]>;
+}) {
   return (
     <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4">
       {items.map((item) => {
@@ -137,6 +205,8 @@ function DoubanGrid({ items, onClick }: { items: DoubanSubject[]; onClick: (titl
           <button
             key={item.id}
             onClick={() => onClick(item.title)}
+            onMouseEnter={() => { if (item.title) void onPreview(item.title); }}
+            onFocus={() => { if (item.title) void onPreview(item.title); }}
             className="group relative rounded-2xl overflow-hidden bg-white/[0.03] hover:bg-white/[0.06] border border-white/[0.04] hover:border-white/[0.08] transition-all duration-300 text-left hover:scale-[1.02] hover:shadow-lg hover:shadow-white/5"
           >
             <div className="aspect-[2/3] relative overflow-hidden">

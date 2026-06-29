@@ -28,8 +28,17 @@ type SortKey = 'default' | 'name' | 'source' | 'year';
 // ===== 模块级缓存（key 含子分类标识） =====
 const globalPageCache = new Map<string, { list: MediaItem[]; total: number; serverFiltered?: boolean }>();
 const globalScrollPositions = new Map<string, number>();
+const globalCategoryState = new Map<string, {
+  page: number;
+  pageSize: number;
+  activeSub: string | null;
+  sourceFilter: string | null;
+  sortBy: SortKey;
+  loadedPages: number[];
+  hasNextPage: boolean;
+}>();
 
-function isValidCacheEntry(entry?: { list: MediaItem[]; total: number }) {
+function isValidCacheEntry(entry?: { list: MediaItem[]; total: number; complete?: boolean }) {
   return !!(entry && entry.list.length > 0);
 }
 
@@ -38,33 +47,50 @@ function cacheKey(categoryId: string, subType: string | null, p: number, ps: num
 }
 
 export default function CategoryPage({ config }: { config: CategoryConfig }) {
-  const ck = cacheKey(config.categoryId, null, 1, 30);
+  const savedState = globalCategoryState.get(config.categoryId);
+  const initialPage = savedState?.page || 1;
+  const initialPageSize = savedState?.pageSize || 30;
+  const initialActiveSub = savedState?.activeSub ?? null;
+  const ck = cacheKey(config.categoryId, initialActiveSub, initialPage, initialPageSize);
   const rawCache = globalPageCache.get(ck);
   const hasValidCache = isValidCacheEntry(rawCache);
 
   const [list, setList] = useState<MediaItem[]>(hasValidCache ? rawCache!.list : []);
   const [total, setTotal] = useState(hasValidCache ? rawCache!.total : 0);
-  const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(30);
+  const [page, setPage] = useState(initialPage);
+  const [pageSize, setPageSize] = useState(initialPageSize);
   const [loading, setLoading] = useState(!hasValidCache);
   const [error, setError] = useState<string | null>(null);
   const [outOfRange, setOutOfRange] = useState(false);
-  const [activeSub, setActiveSub] = useState<string | null>(null);
-  const [serverFiltered, setServerFiltered] = useState(false); // 当前结果是否由服务端 type_id 过滤
+  const [activeSub, setActiveSub] = useState<string | null>(initialActiveSub);
+  const [serverFiltered, setServerFiltered] = useState(!!rawCache?.serverFiltered); // 当前结果是否由服务端 type_id 过滤
   const [subCounts, setSubCounts] = useState<Record<string, number> | null>(null); // 服务端返回的子分类计数
-  const [sourceFilter, setSourceFilter] = useState<string | null>(null);
-  const [sortBy, setSortBy] = useState<SortKey>('default');
+  const [sourceFilter, setSourceFilter] = useState<string | null>(savedState?.sourceFilter ?? null);
+  const [sortBy, setSortBy] = useState<SortKey>(savedState?.sortBy ?? 'default');
 
   // === 渐进式分页状态 ===
-  const loadedPagesRef = useRef<Set<number>>(new Set(hasValidCache ? [1] : []));
-  const [hasNextPage, setHasNextPage] = useState(true);
+  const loadedPagesRef = useRef<Set<number>>(new Set(savedState?.loadedPages?.length ? savedState.loadedPages : (hasValidCache ? [initialPage] : [])));
+  const [hasNextPage, setHasNextPage] = useState(savedState?.hasNextPage ?? true);
   const [renderTick, setRenderTick] = useState(0);
 
   const navigate = useNavigate();
   const abortRef = useRef<AbortController | null>(null);
+  const refreshTimerRef = useRef<number | null>(null);
   const fetchGenRef = useRef(0);
-  const activeSubRef = useRef<string | null>(null);
+  const activeSubRef = useRef<string | null>(initialActiveSub);
   const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    globalCategoryState.set(config.categoryId, {
+      page,
+      pageSize,
+      activeSub,
+      sourceFilter,
+      sortBy,
+      loadedPages: Array.from(loadedPagesRef.current),
+      hasNextPage,
+    });
+  }, [config.categoryId, page, pageSize, activeSub, sourceFilter, sortBy, hasNextPage, renderTick]);
 
   useEffect(() => {
     return () => {
@@ -79,7 +105,7 @@ export default function CategoryPage({ config }: { config: CategoryConfig }) {
     }
   }, [config.categoryId, hasValidCache]);
 
-  const fetchPage = useCallback(async (p: number, ps: number, sub?: string | null) => {
+  const fetchPage = useCallback(async (p: number, ps: number, sub?: string | null, options?: { keepCurrent?: boolean }) => {
     const subType = sub ?? activeSubRef.current;
     const ck = cacheKey(config.categoryId, subType, p, ps);
     const cached = globalPageCache.get(ck);
@@ -98,22 +124,22 @@ export default function CategoryPage({ config }: { config: CategoryConfig }) {
     abortRef.current = controller;
     const gen = ++fetchGenRef.current;
 
-    setList([]);
+    if (!options?.keepCurrent) setList([]);
     setError(null);
     setOutOfRange(false);
-    setSourceFilter(null);
-    setSortBy('default');
-    setLoading(true);
+    if (!options?.keepCurrent) setLoading(true);
 
     try {
       const data = await getCategory(config.categoryId, config.searchKeyword, p, ps, controller.signal, subType || undefined);
       if (gen !== fetchGenRef.current) return;
 
       if (data.list && data.list.length > 0) {
-        globalPageCache.set(ck, { list: data.list, total: data.total, serverFiltered: !!data.serverFiltered });
-        if (globalPageCache.size > 50) {
-          const firstKey = globalPageCache.keys().next().value;
-          if (firstKey) globalPageCache.delete(firstKey);
+        if (data.complete !== false) {
+          globalPageCache.set(ck, { list: data.list, total: data.total, serverFiltered: !!data.serverFiltered });
+          if (globalPageCache.size > 50) {
+            const firstKey = globalPageCache.keys().next().value;
+            if (firstKey) globalPageCache.delete(firstKey);
+          }
         }
         loadedPagesRef.current.add(p);
         setRenderTick(t => t + 1);
@@ -128,6 +154,16 @@ export default function CategoryPage({ config }: { config: CategoryConfig }) {
       setOutOfRange(!!data.outOfRange || ((data.list?.length ?? 0) === 0 && p > 1 && data.total > 0));
       if (data.subCounts) setSubCounts(data.subCounts);
       setError(null);
+
+      if (data.complete === false && p === 1 && !subType) {
+        if (refreshTimerRef.current) window.clearTimeout(refreshTimerRef.current);
+        refreshTimerRef.current = window.setTimeout(() => {
+          fetchPage(p, ps, subType, { keepCurrent: true });
+        }, 6500);
+      } else if (refreshTimerRef.current) {
+        window.clearTimeout(refreshTimerRef.current);
+        refreshTimerRef.current = null;
+      }
     } catch (e: any) {
       if (e.name === 'AbortError' || gen !== fetchGenRef.current) return;
       setError(e?.message || '网络请求失败，请检查 API 服务是否正常运行');
@@ -155,6 +191,8 @@ export default function CategoryPage({ config }: { config: CategoryConfig }) {
   }, [pageSize, fetchPage, maxClickablePage]);
   const handlePageSizeChange = useCallback((ps: number) => {
     setPageSize(ps); setPage(1);
+    setSourceFilter(null);
+    setSortBy('default');
     loadedPagesRef.current.clear();
     setHasNextPage(true);
     setRenderTick(t => t + 1);
@@ -169,6 +207,8 @@ export default function CategoryPage({ config }: { config: CategoryConfig }) {
     setTotal(0);
     setServerFiltered(false);
     setSubCounts(null);
+    setSourceFilter(null);
+    setSortBy('default');
     setHasNextPage(true);
     loadedPagesRef.current.clear();
     setRenderTick(t => t + 1);
@@ -178,9 +218,14 @@ export default function CategoryPage({ config }: { config: CategoryConfig }) {
   // ---- 初始加载 ----
   useEffect(() => {
     if (hasValidCache) return;
-    fetchPage(1, pageSize, null);
+    fetchPage(page, pageSize, activeSubRef.current);
     return () => { if (abortRef.current) abortRef.current.abort(); };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => () => {
+    if (abortRef.current) abortRef.current.abort();
+    if (refreshTimerRef.current) window.clearTimeout(refreshTimerRef.current);
+  }, []);
 
   // ---- subCounts 延迟获取（第一次进页面时异步回来后才有值） ----
   useEffect(() => {

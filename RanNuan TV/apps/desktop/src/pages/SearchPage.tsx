@@ -8,6 +8,25 @@ import { detailLink } from '../utils/navigate';
 
 type SortKey = 'default' | 'name' | 'source';
 
+type SearchCacheEntry = {
+  results: MediaItem[];
+  stats: { indexHits: number; cmsHits: number; merged: number } | null;
+  indexCoverage: number;
+  actorLike: boolean;
+};
+
+const searchCache = new Map<string, SearchCacheEntry>();
+
+function dedupeResults(list: MediaItem[]) {
+  const seen = new Set<string>();
+  return list.filter(item => {
+    const key = `${item.site_key || item.site_name || ''}:${item.vod_id || item.vod_name}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 export default function SearchPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const wd = searchParams.get('wd') || '';
@@ -26,34 +45,50 @@ export default function SearchPage() {
   const navigate = useNavigate();
   const abortRef = useRef<AbortController | null>(null);
   const mergedRef = useRef(false); // 防止 merged 后被后续 videos 污染
+  const freshChunkRef = useRef(false);
+  const actorMetaRef = useRef({ actorLike: false, indexCoverage: 0 });
   const inputRef = useRef<HTMLInputElement>(null);
 
   const doSearch = useCallback(async (q: string) => {
-    if (!q.trim()) return;
+    const query = q.trim();
+    if (!query) return;
 
     if (abortRef.current) abortRef.current.abort();
     const controller = new AbortController();
     abortRef.current = controller;
+    const cached = searchCache.get(query);
 
     setLoading(true);
-    setResults([]);
+    if (cached) {
+      setResults(cached.results);
+      setSearchStats(cached.stats);
+      setIndexCoverage(cached.indexCoverage);
+      setActorLike(cached.actorLike);
+    }
     setScanning(false);
-    setSearchStats(null);
-    setIndexCoverage(0);
-    setActorLike(false);
+    if (!cached) {
+      setSearchStats(null);
+      setIndexCoverage(0);
+      setActorLike(false);
+    }
     mergedRef.current = false;
-    setKeyword(q);
+    freshChunkRef.current = !!cached;
+    setKeyword(query);
     setProgress({ completed: 0, total: 0, phase: '' });
     setSourceFilter(null);
     setSortBy('default');
 
     try {
       await searchMediaStream(
-        q.trim(),
+        query,
         (videos) => {
           // merged 后忽略后续 videos，防止将合并结果重新污染为未合并状态
           if (mergedRef.current) return;
-          setResults(prev => [...prev, ...videos]);
+          setResults(prev => {
+            const next = freshChunkRef.current ? dedupeResults([...prev, ...videos]) : dedupeResults(videos);
+            freshChunkRef.current = true;
+            return next;
+          });
         },
         ({ completed, total, phase }) => {
           setProgress({ completed, total, phase: phase || '' });
@@ -62,11 +97,23 @@ export default function SearchPage() {
         controller.signal,
         (merged, stats) => {
           mergedRef.current = true;
-          setResults(merged);
+          const next = dedupeResults(merged);
+          setResults(next);
           if (stats) setSearchStats(stats);
           setScanning(false);
+          searchCache.set(query, {
+            results: next,
+            stats: stats || null,
+            indexCoverage: actorMetaRef.current.indexCoverage,
+            actorLike: actorMetaRef.current.actorLike,
+          });
+          if (searchCache.size > 20) {
+            const firstKey = searchCache.keys().next().value;
+            if (firstKey) searchCache.delete(firstKey);
+          }
         },
         ({ actorLike: al, indexCoverage: ic }) => {
+          actorMetaRef.current = { actorLike: al, indexCoverage: ic };
           setActorLike(al);
           setIndexCoverage(ic);
         },
@@ -75,6 +122,7 @@ export default function SearchPage() {
       if (e.name === 'AbortError') return;
     } finally {
       setLoading(false);
+      if (!freshChunkRef.current && !controller.signal.aborted) setResults([]);
     }
   }, []);
 

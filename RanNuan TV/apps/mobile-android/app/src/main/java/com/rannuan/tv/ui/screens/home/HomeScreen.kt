@@ -78,6 +78,8 @@ import com.rannuan.tv.ui.theme.Zinc400
 import com.rannuan.tv.ui.theme.Zinc500
 import com.rannuan.tv.ui.theme.Zinc950
 import com.rannuan.tv.ui.theme.component.GlassCard
+import com.rannuan.tv.ui.screens.category.prefetchCategoryFirstPages
+import com.rannuan.tv.ui.screens.detail.warmDetailCache
 import com.rannuan.tv.ui.util.ImageProxy
 import kotlinx.coroutines.delay
 import java.net.URLEncoder
@@ -104,6 +106,23 @@ fun HomeScreen(api: RanNuanApi, onNavigate: (String) -> Unit) {
             error = e.message
         } finally {
             loading = false
+        }
+    }
+
+    LaunchedEffect(loading, data) {
+        if (!loading && data != null) {
+            delay(900)
+            prefetchCategoryFirstPages(api)
+            val quickTargets = buildList {
+                addAll((data?.hot ?: emptyList()).take(6))
+                addAll((data?.dianying ?: emptyList()).take(3))
+                addAll((data?.dianshiju ?: emptyList()).take(3))
+            }.distinctBy { it.title.ifBlank { it.vodName } }
+            quickTargets.forEach { item ->
+                val title = item.title.ifBlank { item.vodName }.trim()
+                val key = if (item.siteKey.isNotBlank() && item.vodId.isNotBlank()) "${item.siteKey}:${item.vodId}" else ""
+                if (title.isNotBlank()) warmDetailCache(api, title, key)
+            }
         }
     }
 
@@ -463,7 +482,7 @@ private fun detailRouteFor(item: MediaItem): String {
             "detail/source/$encodedTitle?keys=$keys"
         }
         item.siteKey.isNotBlank() && item.vodId.isNotBlank() -> {
-            "detail/${item.siteKey}/${item.vodId}"
+            "detail/${item.siteKey}/${item.vodId}?name=$encodedTitle"
         }
         title.isNotBlank() -> {
             "detail/source/$encodedTitle?keys="

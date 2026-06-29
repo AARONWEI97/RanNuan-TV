@@ -111,7 +111,7 @@ export default function Sidebar({ onNavigate }: Props) {
         <div className="relative flex items-center gap-2.5 text-[11px] text-zinc-600">
           <span className="flex items-center gap-1.5">
             <span className="w-2 h-2 rounded-full bg-brand-500/40 shadow-[0_0_6px] shadow-brand-500/20" />
-            <span className="tracking-wide">v1.5</span>
+            <span className="tracking-wide">v2.0</span>
           </span>
           <span className="text-zinc-700">—</span>
           <span className="tracking-wider text-zinc-600">RanNuan TV</span>

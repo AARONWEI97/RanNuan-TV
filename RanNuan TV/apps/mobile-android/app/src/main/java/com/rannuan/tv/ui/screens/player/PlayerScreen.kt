@@ -7,6 +7,7 @@ import android.media.AudioManager
 import android.net.Uri
 import android.util.Log
 import android.view.WindowManager
+import android.os.SystemClock
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibilityScope
 import androidx.compose.animation.core.RepeatMode
@@ -125,6 +126,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
@@ -154,6 +156,7 @@ import com.rannuan.tv.ui.util.formatSourceName
 import com.rannuan.tv.ui.util.stripHtml
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.roundToInt
 import androidx.annotation.OptIn as AndroidOptIn
 
@@ -178,6 +181,8 @@ fun PlayerScreen(
     siteKey: String, id: String,
     sourceIdx: Int = 0, epIdx: Int = 0,
     resumePos: Long = 0L,   // 续播位置（毫秒），来自历史记录
+    name: String = "",
+    keys: String = "",
     api: RanNuanApi,
     onBack: () -> Unit,
     onNavigate: (String) -> Unit
@@ -228,11 +233,17 @@ fun PlayerScreen(
     var buffered by remember { mutableLongStateOf(0L) }
     var playbackError by remember { mutableStateOf<String?>(null) }
     var usingProxy by remember { mutableStateOf(false) }
+    var forceProxyHls by remember { mutableStateOf(false) }
     var selectedSpeed by remember { mutableFloatStateOf(1f) }
     var longPressActive by remember { mutableStateOf(false) }
     val playbackSpeed = if (longPressActive) 2f else selectedSpeed
     var isLocked by remember { mutableStateOf(false) }
     var buffering by remember { mutableStateOf(false) }
+    var bufferedAheadMs by remember { mutableLongStateOf(0L) }
+    var transferBytes by remember { mutableLongStateOf(0L) }
+    var transferRateText by remember { mutableStateOf("--") }
+    var renderedFirstFrame by remember { mutableStateOf(false) }
+    var playbackStartedAt by remember { mutableLongStateOf(0L) }
 
     // 相似推荐
     var relatedVideos by remember { mutableStateOf<List<RelatedMediaItem>>(emptyList()) }
@@ -390,9 +401,8 @@ fun PlayerScreen(
         }
     }
 
-    // ── 播放辅助函数：直链 & m3u8 统一入口 ──
-    // 切换到新线路时已由 LaunchedEffect 调用 exoPlayer.stop() + 重置 usingProxy
-    fun tryPlayVideo(proxy: Boolean, fromError: Boolean = false) {
+    // ── 播放辅助函数：真实媒体地址先直连，分享页/无扩展名地址直接走代理解析。
+    fun tryPlayVideo(proxy: Boolean, fromError: Boolean = false, forceHlsMime: Boolean = false) {
         val s = sources.getOrNull(currentSrc) ?: return
         val e = s.episodes.getOrNull(currentEp) ?: return
         // 规范化 URL（补协议头、去掉空格）
@@ -404,24 +414,26 @@ fun PlayerScreen(
             }
         }
 
-        // 判断是否为 m3u8（ExoPlayer 原生支持，可直连）
-        val isM3u8 = raw.contains(".m3u8", ignoreCase = true)
+        val isM3u8 = isM3u8Url(raw)
+        val isTs = isTsUrl(raw)
+        val looksLikeSharePage = !isM3u8 && !isTs && !hasDirectVideoFileExtension(raw)
 
-        // 非 m3u8 的直链（mp4/ts/flv/分享页等）→ 直接走代理
-        // 服务端代理会：1) 解析分享页提取真实视频地址 2) 处理防盗链 Referer 3) 重写 m3u8 内部分片 URL
-        // m3u8 → 先直连（快），失败自动回退代理
-        val useProxy = proxy || !isM3u8
+        // 分享页/无扩展名播放地址通常返回 HTML，不能直喂 ExoPlayer，需要先交给后端解析。
+        // 标准 m3u8、mp4、ts 等真实媒体地址仍先直连，失败后再切代理。
+        val useProxy = proxy || looksLikeSharePage
         val uri = if (useProxy) {
             "${com.rannuan.tv.BuildConfig.SERVER_URL}/api/proxy?url=${Uri.encode(raw)}"
         } else raw
 
-        Log.d("PlayerScreen", "播放: ${if(useProxy) "代理" else "直连"} | m3u8=$isM3u8 | 原始=${raw.take(80)}")
+        Log.d("PlayerScreen", "播放: ${if(useProxy) "代理" else "直连"} | m3u8=$isM3u8 | ts=$isTs | share=$looksLikeSharePage | 原始=${raw.take(80)}")
         Log.d("PlayerScreen", "最终URI: ${uri.take(120)}")
 
         // 记录代理状态，避免 onPlayerError 里重复走代理
         if (useProxy) usingProxy = true
+        renderedFirstFrame = false
+        playbackStartedAt = SystemClock.elapsedRealtime()
 
-        // 直连 m3u8 时设置 Referer 头绕过防盗链
+        // 直连时设置 Referer 头绕过防盗链
         if (!useProxy) {
             val referer = when {
                 raw.contains("bfzy") || raw.contains("picbf") -> "https://bfzyapi.com"
@@ -436,11 +448,12 @@ fun PlayerScreen(
         }
 
         exoPlayer.stop()
-        // 代理模式：强制 HLS MIME 类型，否则 ExoPlayer 认不出代理返回的 m3u8
-        val mediaItem = if (useProxy) {
-            MediaItem.Builder().setUri(uri).setMimeType(MimeTypes.APPLICATION_M3U8).build()
-        } else {
-            MediaItem.fromUri(uri)
+        // 代理分享页通常返回 m3u8；TS 是二进制流，移动端显式标注 MPEG-TS。
+        val shouldForceHls = isM3u8 || forceHlsMime || (useProxy && (looksLikeSharePage || forceProxyHls))
+        val mediaItem = when {
+            shouldForceHls -> MediaItem.Builder().setUri(uri).setMimeType(MimeTypes.APPLICATION_M3U8).build()
+            isTs -> MediaItem.Builder().setUri(uri).setMimeType(MimeTypes.VIDEO_MP2T).build()
+            else -> MediaItem.fromUri(uri)
         }
         // 记录观看历史
         detail?.let { d ->
@@ -454,6 +467,7 @@ fun PlayerScreen(
         exoPlayer.setMediaItem(mediaItem)
         exoPlayer.prepare()
         exoPlayer.playWhenReady = true
+        exoPlayer.play()
 
         if (fromError) playbackError = null
     }
@@ -468,6 +482,7 @@ fun PlayerScreen(
                 if (state == Player.STATE_READY) {
                     duration = exoPlayer.duration.coerceAtLeast(0)
                     playbackError = null
+                    bufferedAheadMs = (exoPlayer.bufferedPosition - exoPlayer.currentPosition).coerceAtLeast(0L)
                     // 续播：首次就绪后跳到历史位置（仅执行一次）
                     if (pendingResumePos > 0) {
                         exoPlayer.seekTo(pendingResumePos.coerceAtMost(duration))
@@ -480,16 +495,44 @@ fun PlayerScreen(
             }
             override fun onPlayerError(e: PlaybackException) {
                 if (!usingProxy) {
-                    // 直连 m3u8 失败 → 自动切代理重试
+                    // 直连失败 → 自动切代理重试。先按原样代理，再用 HLS 兜底。
                     usingProxy = true
                     tryPlayVideo(proxy = true, fromError = true)
+                } else if (!forceProxyHls) {
+                    // 代理 URL 无扩展名或后端解析结果与原 URL 后缀不一致时，再按 HLS 明确重试一次
+                    forceProxyHls = true
+                    tryPlayVideo(proxy = true, fromError = true, forceHlsMime = true)
                 } else {
                     // 代理也失败 → 显示友好错误信息
                     playbackError = "当前线路播放失败，请尝试切换其他线路"
                 }
             }
+
+            override fun onIsLoadingChanged(isLoading: Boolean) {
+                buffering = isLoading || exoPlayer.playbackState == Player.STATE_BUFFERING
+            }
+
+            override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                // no-op
+            }
+
+            override fun onRenderedFirstFrame() {
+                renderedFirstFrame = true
+            }
+        }
+        val analyticsListener = object : AnalyticsListener {
+            override fun onBandwidthEstimate(
+                eventTime: AnalyticsListener.EventTime,
+                totalLoadTimeMs: Int,
+                totalBytesLoaded: Long,
+                bitrateEstimate: Long
+            ) {
+                if (totalBytesLoaded > 0) transferBytes += totalBytesLoaded
+                if (bitrateEstimate > 0) transferRateText = formatNetworkSpeed(bitrateEstimate)
+            }
         }
         exoPlayer.addListener(listener)
+        exoPlayer.addAnalyticsListener(analyticsListener)
         val obs = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_PAUSE) {
                 exoPlayer.pause()
@@ -502,6 +545,7 @@ fun PlayerScreen(
             savePlayPosition()
             lifecycle.lifecycle.removeObserver(obs)
             exoPlayer.removeListener(listener)
+            exoPlayer.removeAnalyticsListener(analyticsListener)
             exoPlayer.release()
         }
     }
@@ -513,6 +557,7 @@ fun PlayerScreen(
                 currentPosition = exoPlayer.currentPosition
                 duration = exoPlayer.duration.coerceAtLeast(0)
                 buffered = exoPlayer.bufferedPosition.coerceAtLeast(0)
+                bufferedAheadMs = (buffered - currentPosition).coerceAtLeast(0L)
             }
             delay(300)
         }
@@ -564,13 +609,27 @@ fun PlayerScreen(
     }
 
     // ── 加载详情 ──
-    LaunchedEffect(siteKey, id) {
+    LaunchedEffect(siteKey, id, name, keys) {
         loading = true; error = null
         try {
-            val resp = api.getMultiDetail(wd = "", keys = "$siteKey:$id")
-            val primary = resp.list.firstOrNull()
+            val titleQuery = name
+            val keyParam = keys.takeIf { it.isNotBlank() } ?: "$siteKey:$id"
+            val firstResp = api.getMultiDetail(wd = titleQuery, keys = keyParam)
+            val fallbackResp = if (firstResp.list.isEmpty()) {
+                when {
+                    titleQuery.isNotBlank() -> api.getMultiDetail(wd = titleQuery, keys = "")
+                    keyParam != "$siteKey:$id" -> api.getMultiDetail(wd = "", keys = "$siteKey:$id")
+                    else -> firstResp
+                }
+            } else firstResp
+            val list = fallbackResp.list
+            val primary = list.firstOrNull { it.siteKey == siteKey && it.vodId == id } ?: list.firstOrNull()
             detail = primary
-            sourceDetails = resp.list
+            sourceDetails = if (primary != null && list.none { it.siteKey == primary.siteKey && it.vodId == primary.vodId }) {
+                listOf(primary) + list
+            } else {
+                list
+            }
             if (detail == null) error = "未找到影片信息"
         } catch (e: Exception) { error = e.message }
         finally { loading = false }
@@ -596,10 +655,11 @@ fun PlayerScreen(
         }
     }
 
-    // ── 相似推荐：多路召回 + 相关性打分，避免只拿同分类首页导致结果泛化 ──
+    // ── 相似推荐：优先走桌面端同款分类召回，失败再用演员搜索兜底。保证先有结果，再谈排序。
     LaunchedEffect(detail) {
         val d = detail ?: return@LaunchedEffect
         relatedLoading = true
+        relatedVideos = emptyList()
         try {
             val tn = (d.typeName ?: "").replace(Regex("[片剧]$"), "")
             val category = when {
@@ -609,43 +669,59 @@ fun PlayerScreen(
                 else -> "movie" to mapMovieSub(tn)
             }
 
-            val candidates = linkedMapOf<String, RelatedMediaItem>()
-            suspend fun addSearch(keyword: String) {
-                if (keyword.length < 2) return
-                api.search(keyword).list.forEach { item ->
-                    candidates.putIfAbsent("${item.siteKey}:${item.vodId}", item)
-                }
-            }
-            suspend fun addCategory(subType: String?, pageSize: Int) {
-                api.getCategory(
-                    com.rannuan.tv.data.api.CategoryRequest(
-                        category = category.first,
-                        subType = subType,
-                        page = 1,
-                        pageSize = pageSize
+            fun clean(list: List<RelatedMediaItem>): List<RelatedMediaItem> =
+                list.asSequence()
+                    .filterNot { it.siteKey == d.siteKey && it.vodId == d.vodId }
+                    .filterNot { it.vodName == d.vodName }
+                    .distinctBy { "${it.siteKey}:${it.vodId}" }
+                    .sortedWith(
+                        compareByDescending<RelatedMediaItem> { relatedScore(d, it, category.second) }
+                            .thenByDescending { it.rating ?: 0.0 }
                     )
-                ).list.forEach { item ->
-                    candidates.putIfAbsent("${item.siteKey}:${item.vodId}", item)
+                    .take(10)
+                    .toList()
+
+            suspend fun fillFromCategory(subType: String? = category.second, timeoutMs: Long = 5000L, pageSize: Int = 16): Boolean {
+                val result = withTimeoutOrNull(timeoutMs) {
+                    api.getCategory(
+                        com.rannuan.tv.data.api.CategoryRequest(
+                            category = category.first,
+                            subType = subType,
+                            page = 1,
+                            pageSize = pageSize
+                        )
+                    )
+                }?.list.orEmpty()
+                val batch = clean(result)
+                if (batch.isEmpty()) return false
+                relatedVideos = batch
+                return true
+            }
+
+            if (!fillFromCategory()) {
+                fillFromCategory(subType = null, timeoutMs = 3200L, pageSize = 20)
+            }
+
+            if (relatedVideos.isEmpty()) {
+                val searchKeywords = buildList {
+                    addAll(splitPeople(d.vodActor).take(2))
+                    d.vodDirector?.let { addAll(splitPeople(it).take(1)) }
+                    d.vodName.takeIf { it.isNotBlank() }?.let { add(it) }
+                }.distinct().filter { it.length >= 2 }.take(4)
+
+                for (kw in searchKeywords) {
+                    if (relatedVideos.isNotEmpty()) break
+                    val searched = clean(withTimeoutOrNull(3000) { api.search(kw) }?.list.orEmpty())
+                    if (searched.isNotEmpty()) relatedVideos = searched
                 }
             }
 
-            splitPeople(d.vodActor).take(4).forEach { addSearch(it) }
-            splitPeople(d.vodDirector).take(2).forEach { addSearch(it) }
-            category.second?.let { addCategory(it, 28) }
-            addCategory(null, 28)
-
-            relatedVideos = candidates.values
-                .filterNot { it.siteKey == d.siteKey && it.vodId == d.vodId }
-                .filterNot { it.vodName == d.vodName }
-                .map { item -> item to relatedScore(d, item, category.second) }
-                .filter { (_, score) -> score > 0 }
-                .sortedWith(
-                    compareByDescending<Pair<RelatedMediaItem, Int>> { it.second }
-                        .thenByDescending { it.first.rating ?: 0.0 }
-                        .thenBy { it.first.vodName.length }
-                )
-                .map { it.first }
-                .take(10)
+            if (relatedVideos.isEmpty()) {
+                val titleSeed = d.vodName.take(6).takeIf { it.isNotBlank() } ?: d.vodActor.orEmpty().take(6)
+                if (!titleSeed.isNullOrBlank()) {
+                    relatedVideos = clean(withTimeoutOrNull(2500) { api.search(titleSeed) }?.list.orEmpty())
+                }
+            }
         } catch (_: Exception) {
             relatedVideos = emptyList()
         }
@@ -654,12 +730,27 @@ fun PlayerScreen(
 
     // 切换线路/集数时：重置代理状态 + 错误信息，新线路从直连开始尝试
     LaunchedEffect(detail, currentSrc, currentEp) {
+        if (detail == null) return@LaunchedEffect
         usingProxy = false
+        forceProxyHls = false
         playbackError = null
         pendingResumePos = if (currentSrc == sourceIdx && currentEp == epIdx) pendingResumePos else 0L
         exoPlayer.stop()
         exoPlayer.clearMediaItems()
         tryPlayVideo(proxy = false)
+    }
+
+    LaunchedEffect(detail, currentSrc, currentEp, usingProxy, renderedFirstFrame, playbackStartedAt) {
+        if (detail == null || usingProxy || renderedFirstFrame || playbackStartedAt <= 0L) return@LaunchedEffect
+        delay(3500)
+        val stillSameAttempt = !usingProxy && !renderedFirstFrame && playbackStartedAt > 0L
+        val noProgress = exoPlayer.currentPosition <= 500L
+        val readyButSilent = exoPlayer.playbackState == Player.STATE_READY && !exoPlayer.isPlaying
+        if (stillSameAttempt && (readyButSilent || noProgress)) {
+            Log.d("PlayerScreen", "直连已就绪但未渲染首帧/无进度，自动切代理兜底")
+            usingProxy = true
+            tryPlayVideo(proxy = true, fromError = true)
+        }
     }
 
     // 全屏：横屏 + 沉浸式系统栏
@@ -692,7 +783,12 @@ fun PlayerScreen(
 
     // 双击：播放/暂停切换
     fun handleDoubleTap(@Suppress("UNUSED_PARAMETER") xPercent: Float) {
-        if (isPlaying) exoPlayer.pause() else { exoPlayer.playWhenReady = true }
+        if (isPlaying) {
+            exoPlayer.pause()
+        } else {
+            exoPlayer.playWhenReady = true
+            exoPlayer.play()
+        }
     }
 
     // 手势层 PointerInput：单击/双击/长按（onPress 感知松手恢复倍速）
@@ -809,6 +905,7 @@ fun PlayerScreen(
                                     // 次操作：重试
                                     TextButton(onClick = {
                                         usingProxy = false
+                                        forceProxyHls = false
                                         playbackError = null
                                         exoPlayer.stop()
                                         tryPlayVideo(proxy = false)
@@ -826,6 +923,24 @@ fun PlayerScreen(
                             color = Color.White.copy(alpha = 0.9f),
                             modifier = Modifier.align(Alignment.Center).size(44.dp), strokeWidth = 3.dp
                         )
+                    }
+                    if (buffering && playbackError == null) {
+                        Surface(
+                            color = Color.Black.copy(alpha = 0.5f),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier
+                                .align(Alignment.BottomStart)
+                                .padding(start = 12.dp, bottom = if (isFullscreen) 76.dp else 62.dp)
+                        ) {
+                            Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
+                                Text("正在缓冲", color = Color.White, fontSize = 11.sp)
+                                Text("已预载 ${formatBufferedAhead(bufferedAheadMs)}", color = Zinc300, fontSize = 10.sp)
+                                Text("网速 $transferRateText", color = Brand400, fontSize = 11.sp)
+                                if (transferBytes > 0) {
+                                    Text("已加载 ${formatBytes(transferBytes)}", color = Zinc400, fontSize = 10.sp)
+                                }
+                            }
+                        }
                     }
 
                     // ── 手势层（非锁定时接管所有手势）──
@@ -1135,7 +1250,14 @@ fun PlayerScreen(
                                 ) {
                                     // 播放/暂停
                                     IconButton(
-                                        onClick = { if (isPlaying) exoPlayer.pause() else { exoPlayer.playWhenReady = true } },
+                                        onClick = {
+                                            if (isPlaying) {
+                                                exoPlayer.pause()
+                                            } else {
+                                                exoPlayer.playWhenReady = true
+                                                exoPlayer.play()
+                                            }
+                                        },
                                         modifier = Modifier.size(40.dp)
                                     ) {
                                         Icon(
@@ -1436,7 +1558,8 @@ fun PlayerScreen(
                                         modifier = Modifier.width(105.dp)
                                             .clip(ShapeCard)
                                             .clickable {
-                                                onNavigate("detail/${video.siteKey}/${video.vodId}")
+                                                val encodedTitle = java.net.URLEncoder.encode(video.vodName, "UTF-8")
+                                                onNavigate("detail/${video.siteKey}/${video.vodId}?name=$encodedTitle")
                                             }
                                     ) {
                                         Box(Modifier.fillMaxWidth().aspectRatio(2f / 3f).clip(RoundedCornerShape(8.dp)).background(Zinc800)) {
@@ -2284,7 +2407,7 @@ private fun PlayerSeekBar(
         }
         // ── thumb 层：App Logo 图标 ──
         val thumbSizePx = with(density) { thumbSize.roundToPx() }
-        val thumbOffsetPx = ((barWidthPx - thumbSizePx) * p).roundToInt().coerceAtLeast(0)
+        val thumbOffsetPx = ((barWidthPx * p) - thumbSizePx / 2f).roundToInt()
         Icon(
             painter = painterResource(R.drawable.thumb_logo),
             contentDescription = "进度",
@@ -2471,8 +2594,52 @@ private fun formatTime(ms: Long): String {
     return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%02d:%02d".format(m, s)
 }
 
+private fun formatBytes(bytes: Long): String {
+    val value = bytes.toDouble().coerceAtLeast(0.0)
+    return when {
+        value >= 1024.0 * 1024.0 * 1024.0 -> String.format("%.2f GB", value / 1024.0 / 1024.0 / 1024.0)
+        value >= 1024.0 * 1024.0 -> String.format("%.1f MB", value / 1024.0 / 1024.0)
+        value >= 1024.0 -> String.format("%.0f KB", value / 1024.0)
+        else -> "${value.toLong()} B"
+    }
+}
+
+private fun formatBufferedAhead(ms: Long): String {
+    val seconds = (ms / 1000).coerceAtLeast(0)
+    return if (seconds >= 60) {
+        "${seconds / 60}分${seconds % 60}秒"
+    } else {
+        "${seconds}秒"
+    }
+}
+
+private fun formatNetworkSpeed(bitrateEstimate: Long): String {
+    val bytesPerSecond = (bitrateEstimate / 8.0).coerceAtLeast(0.0)
+    return when {
+        bytesPerSecond >= 1024.0 * 1024.0 -> String.format("%.1f MB/s", bytesPerSecond / 1024.0 / 1024.0)
+        bytesPerSecond >= 1024.0 -> String.format("%.1f KB/s", bytesPerSecond / 1024.0)
+        else -> "${bytesPerSecond.toInt()} B/s"
+    }
+}
+
 private fun speedLabel(speed: Float): String =
     if (speed == 1f) "倍速" else "${speed}×"
+
+private fun isM3u8Url(url: String): Boolean =
+    url.substringBefore('?').substringBefore('#').endsWith(".m3u8", ignoreCase = true) ||
+        url.contains(".m3u8?", ignoreCase = true) ||
+        url.contains(".m3u8#", ignoreCase = true)
+
+private fun isTsUrl(url: String): Boolean {
+    val path = url.substringBefore('?').substringBefore('#')
+    return path.endsWith(".ts", ignoreCase = true) || url.contains(".ts?", ignoreCase = true)
+}
+
+private fun hasDirectVideoFileExtension(url: String): Boolean {
+    val path = url.substringBefore('?').substringBefore('#')
+    return listOf(".mp4", ".webm", ".flv", ".ts", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".ogg")
+        .any { path.endsWith(it, ignoreCase = true) }
+}
 
 // ── 相似推荐类型映射（type_name → subType，与服务端 SUB_TYPE_MAP 对应）──
 private fun mapMovieSub(tn: String): String? = when {
