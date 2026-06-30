@@ -34,7 +34,6 @@ import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import android.os.Build
 import com.rannuan.tv.data.api.RanNuanApi
-import com.rannuan.tv.data.api.CategoryRequest
 import com.rannuan.tv.data.model.MediaDetail
 import com.rannuan.tv.ui.theme.*
 import com.rannuan.tv.ui.util.FavoritesStore
@@ -145,7 +144,6 @@ fun DetailScreen(
     var favorited by remember {
         mutableStateOf(FavoritesStore.isFavorited(context, siteKey, id))
     }
-    var warmTriggered by remember { mutableStateOf(false) }
     val contentVisible = remember { androidx.compose.animation.core.MutableTransitionState(false) }
 
     // 加载数据
@@ -174,7 +172,7 @@ fun DetailScreen(
         try {
             // 1. 优先用 keys 精准拉取（快）
             val resp = api.getMultiDetail(wd = wd, keys = realKeys)
-            val result = resp.list.toMutableList()
+            val result = rankDetailResults(resp.list, wd, realKeys).toMutableList()
 
             details = result
             DetailMemoryCache.put(wd, realKeys, result)
@@ -188,50 +186,6 @@ fun DetailScreen(
             error = e.message
         } finally {
             loading = false
-        }
-    }
-
-    LaunchedEffect(wd, realKeys, details.size) {
-        if (warmTriggered || details.isEmpty()) return@LaunchedEffect
-        warmTriggered = true
-        val d = details.firstOrNull() ?: return@LaunchedEffect
-        val nameForSearch = wd.takeIf { it.isNotBlank() } ?: d.vodName.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
-        val warmed = DetailWarmCache.get(nameForSearch, realKeys)
-        if (warmed != null) return@LaunchedEffect
-        runCatching {
-            val resp = api.getMultiDetail(wd = nameForSearch, keys = "")
-            val result = resp.list.toMutableList()
-            if (result.isEmpty()) return@runCatching
-            val existing = result.map { "${it.siteKey}:${it.vodId}" }.toMutableSet()
-            runCatching {
-                val category = when {
-                    (d.typeName ?: "").contains("动漫") -> "anime"
-                    (d.typeName ?: "").contains("综艺") -> "variety"
-                    (d.typeName ?: "").contains("剧") -> "tv"
-                    else -> "movie"
-                }
-                val warm = api.getCategory(CategoryRequest(category = category, page = 1, pageSize = 20))
-                warm.list.forEach { item ->
-                    val key = "${item.siteKey}:${item.vodId}"
-                    if (key !in existing) result.add(MediaDetail(
-                        vodId = item.vodId,
-                        vodName = item.vodName,
-                        vodPic = item.vodPic,
-                        typeName = item.typeName,
-                        vodContent = item.vodContent,
-                        vodActor = item.vodActor,
-                        vodDirector = null,
-                        vodYear = item.vodYear,
-                        vodArea = item.vodArea,
-                        vodRemarks = item.vodRemarks,
-                        vodPlayFrom = "",
-                        vodPlayUrl = "",
-                        siteKey = item.siteKey,
-                        siteName = item.siteName
-                    ))
-                }
-            }
-            DetailWarmCache.put(nameForSearch, realKeys, result)
         }
     }
 
@@ -541,3 +495,35 @@ private fun parseSources(detail: MediaDetail): List<PlaySource> {
         PlaySource(formatSourceName(rawName.trim(), i, detail.siteKey), episodes)
     }.filter { it.episodes.isNotEmpty() }
 }
+
+private fun rankDetailResults(list: List<MediaDetail>, expectedTitle: String, keys: String): List<MediaDetail> {
+    if (list.isEmpty()) return list
+    val keySet = keys.split(",")
+        .map { it.trim() }
+        .filter { it.contains(":") }
+        .toSet()
+    val expectedNorm = normalizeDetailTitle(expectedTitle)
+
+    return list.sortedWith(
+        compareByDescending<MediaDetail> { "${it.siteKey}:${it.vodId}" in keySet }
+            .thenByDescending { item ->
+                val itemNorm = normalizeDetailTitle(item.vodName)
+                when {
+                    expectedNorm.isBlank() -> 0
+                    itemNorm == expectedNorm -> 4
+                    itemNorm.contains(expectedNorm) || expectedNorm.contains(itemNorm) -> 2
+                    else -> 0
+                }
+            }
+            .thenByDescending { !it.vodDirector.isNullOrBlank() }
+            .thenByDescending { !it.vodYear.isNullOrBlank() }
+            .thenByDescending { !it.vodPlayUrl.isNullOrBlank() }
+    )
+}
+
+private fun normalizeDetailTitle(value: String?): String =
+    value.orEmpty()
+        .lowercase()
+        .replace(Regex("第[一二三四五六七八九十0-9]+季"), "")
+        .replace(Regex("[\\s:：·.。!！?？\\-_/\\\\（）()【】\\[\\]]+"), "")
+        .trim()

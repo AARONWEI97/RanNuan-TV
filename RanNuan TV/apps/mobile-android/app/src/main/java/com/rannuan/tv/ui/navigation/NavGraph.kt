@@ -29,7 +29,6 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.rannuan.tv.data.api.RanNuanApi
 import com.rannuan.tv.ui.screens.category.CategoryScreen
-import com.rannuan.tv.ui.screens.category.prefetchCategoryFirstPages
 import com.rannuan.tv.ui.screens.detail.DetailScreen
 import com.rannuan.tv.ui.screens.home.HomeScreen
 import com.rannuan.tv.ui.screens.player.PlayerScreen
@@ -72,10 +71,6 @@ fun MainNavHost(api: RanNuanApi) {
     val showBottomBar = currentRoute?.let { route ->
         bottomBarRoutes.any { route.startsWith(it) }
     } ?: false
-
-    LaunchedEffect(Unit) {
-        prefetchCategoryFirstPages(api)
-    }
 
     Scaffold(
         containerColor = Zinc950,

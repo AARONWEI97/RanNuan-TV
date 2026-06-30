@@ -459,11 +459,15 @@ fun CategoryScreen(type: String, api: RanNuanApi, onNavigate: (String) -> Unit) 
                     MediaCard(item = item) {
                         val title = it.title.ifBlank { it.vodName }.trim()
                         val encodedTitle = java.net.URLEncoder.encode(title, "UTF-8")
-                        val route = if (item.sites != null && item.sites.size > 1) {
-                            val keys = item.sites.joinToString(",") { "${it.key}:${it.id}" }
-                            "detail/source/$encodedTitle?keys=$keys"
-                        } else {
-                            "detail/${it.siteKey}/${it.vodId}?name=$encodedTitle"
+                        val route = when {
+                            it.siteKey.isNotBlank() && it.vodId.isNotBlank() -> {
+                                "detail/${it.siteKey}/${it.vodId}?name=$encodedTitle"
+                            }
+                            !item.sites.isNullOrEmpty() -> {
+                                val keys = item.sites.joinToString(",") { "${it.key}:${it.id}" }
+                                "detail/source/$encodedTitle?keys=$keys"
+                            }
+                            else -> "detail/source/$encodedTitle?keys="
                         }
                         onNavigate(route)
                     }

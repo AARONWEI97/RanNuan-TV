@@ -125,6 +125,7 @@ import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -209,8 +210,13 @@ fun PlayerScreen(
             .setReadTimeoutMs(15000)
     }
     val exoPlayer = remember {
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(15_000, 50_000, 800, 1_500)
+            .setPrioritizeTimeOverSizeThresholds(true)
+            .build()
         ExoPlayer.Builder(context)
             .setMediaSourceFactory(DefaultMediaSourceFactory(dsFactory))
+            .setLoadControl(loadControl)
             .build()
     }
     var showControls by remember { mutableStateOf(true) }
@@ -239,6 +245,7 @@ fun PlayerScreen(
     val playbackSpeed = if (longPressActive) 2f else selectedSpeed
     var isLocked by remember { mutableStateOf(false) }
     var buffering by remember { mutableStateOf(false) }
+    var showBufferingHint by remember { mutableStateOf(false) }
     var bufferedAheadMs by remember { mutableLongStateOf(0L) }
     var transferBytes by remember { mutableLongStateOf(0L) }
     var transferRateText by remember { mutableStateOf("--") }
@@ -582,6 +589,15 @@ fun PlayerScreen(
     // 速度同步（菜单选中倍速 + 长按临时 2x）
     LaunchedEffect(playbackSpeed) { exoPlayer.setPlaybackSpeed(playbackSpeed) }
 
+    LaunchedEffect(buffering, isPlaying, playbackError) {
+        if (buffering && !isPlaying && playbackError == null) {
+            delay(900)
+            showBufferingHint = buffering && !isPlaying && playbackError == null
+        } else {
+            showBufferingHint = false
+        }
+    }
+
     // 画面尺寸
     LaunchedEffect(resizeMode) {
         playerViewRef?.resizeMode = when (resizeMode) {
@@ -635,11 +651,13 @@ fun PlayerScreen(
         finally { loading = false }
     }
 
-    LaunchedEffect(detail?.vodName) {
+    LaunchedEffect(detail?.vodName, renderedFirstFrame) {
         val d = detail ?: return@LaunchedEffect
-        val name = d.vodName.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
+        if (!renderedFirstFrame) return@LaunchedEffect
+        delay(1200)
+        val detailTitle = d.vodName.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
         try {
-            val resp = api.getMultiDetail(wd = name, keys = "")
+            val resp = api.getMultiDetail(wd = detailTitle, keys = "")
             val merged = mutableListOf(d)
             resp.list.forEach { candidate ->
                 val exists = merged.any { existing ->
@@ -656,8 +674,10 @@ fun PlayerScreen(
     }
 
     // ── 相似推荐：优先走桌面端同款分类召回，失败再用演员搜索兜底。保证先有结果，再谈排序。
-    LaunchedEffect(detail) {
+    LaunchedEffect(detail, renderedFirstFrame) {
         val d = detail ?: return@LaunchedEffect
+        if (!renderedFirstFrame) return@LaunchedEffect
+        delay(1500)
         relatedLoading = true
         relatedVideos = emptyList()
         try {
@@ -918,13 +938,13 @@ fun PlayerScreen(
                     }
 
                     // 缓冲圈
-                    if (buffering && playbackError == null) {
+                    if (showBufferingHint) {
                         CircularProgressIndicator(
                             color = Color.White.copy(alpha = 0.9f),
                             modifier = Modifier.align(Alignment.Center).size(44.dp), strokeWidth = 3.dp
                         )
                     }
-                    if (buffering && playbackError == null) {
+                    if (showBufferingHint) {
                         Surface(
                             color = Color.Black.copy(alpha = 0.5f),
                             shape = RoundedCornerShape(12.dp),
