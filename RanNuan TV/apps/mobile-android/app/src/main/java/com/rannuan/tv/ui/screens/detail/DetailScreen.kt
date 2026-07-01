@@ -3,10 +3,16 @@ package com.rannuan.tv.ui.screens.detail
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.*
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
@@ -33,13 +39,23 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import android.os.Build
+import com.google.gson.Gson
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
+import com.google.gson.reflect.TypeToken
 import com.rannuan.tv.data.api.RanNuanApi
+import com.rannuan.tv.data.api.SearchStreamRequest
 import com.rannuan.tv.data.model.MediaDetail
+import com.rannuan.tv.data.model.MediaItem
 import com.rannuan.tv.ui.theme.*
 import com.rannuan.tv.ui.util.FavoritesStore
 import com.rannuan.tv.ui.util.ImageProxy
 import com.rannuan.tv.ui.util.formatSourceName
 import com.rannuan.tv.ui.util.stripHtml
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
 
 private const val DETAIL_CACHE_MAX_ITEMS = 32
 private const val DETAIL_CACHE_TTL_MS = 10 * 60 * 1000L
@@ -99,6 +115,43 @@ object DetailWarmCache {
     }
 }
 
+object DetailPreviewCache {
+    private const val MAX_ITEMS = 48
+    private val cache = object : LinkedHashMap<String, MediaDetail>(MAX_ITEMS, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, MediaDetail>?): Boolean = size > MAX_ITEMS
+    }
+
+    private fun key(name: String, keys: String) = "${name.trim()}|${keys.trim()}"
+
+    @Synchronized fun put(name: String, keys: String, detail: MediaDetail) {
+        if (name.isNotBlank()) cache[key(name, keys)] = detail
+    }
+
+    @Synchronized fun get(name: String, keys: String): MediaDetail? =
+        cache[key(name, keys)] ?: cache[key(name, "")]
+}
+
+fun putDetailPreview(item: MediaItem, title: String, keys: String) {
+    val name = title.ifBlank { item.vodName.ifBlank { item.title } }.trim()
+    if (name.isBlank()) return
+    DetailPreviewCache.put(
+        name,
+        keys,
+        MediaDetail(
+            vodId = item.vodId,
+            vodName = name,
+            vodPic = item.vodPic ?: item.cover,
+            typeName = item.typeName ?: item.type,
+            vodActor = item.vodActor,
+            vodYear = item.vodYear ?: item.year,
+            vodArea = item.vodArea,
+            vodRemarks = item.vodRemarks,
+            siteKey = item.siteKey,
+            siteName = item.siteName
+        )
+    )
+}
+
 suspend fun warmDetailCache(api: RanNuanApi, wd: String, keys: String) {
     val cacheKey = keys.trim()
     val query = wd.trim()
@@ -136,8 +189,9 @@ fun DetailScreen(
         ?: (if (siteKey.isNotBlank() && id.isNotBlank()) "$siteKey:$id" else "")
     val wd = name
 
-    var details by remember { mutableStateOf<List<MediaDetail>>(emptyList()) }
-    var loading by remember { mutableStateOf(true) }
+    val preview = remember(wd, realKeys) { DetailPreviewCache.get(wd, realKeys) }
+    var details by remember(wd, realKeys) { mutableStateOf(preview?.let { listOf(it) } ?: emptyList()) }
+    var loading by remember(wd, realKeys) { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
     var activeIdx by remember { mutableStateOf(0) }
     var selectedSourceIdx by remember { mutableStateOf(0) }
@@ -173,15 +227,29 @@ fun DetailScreen(
             // 1. 优先用 keys 精准拉取（快）
             val resp = api.getMultiDetail(wd = wd, keys = realKeys)
             val result = rankDetailResults(resp.list, wd, realKeys).toMutableList()
-
-            details = result
-            DetailMemoryCache.put(wd, realKeys, result)
-            val nameForCache = wd.takeIf { it.isNotBlank() } ?: result.firstOrNull()?.vodName.orEmpty()
-            if (nameForCache.isNotBlank()) {
-                DetailWarmCache.put(nameForCache, realKeys, result)
-                DetailWarmCache.put(nameForCache, "", result)
+            if (result.isEmpty() && wd.isNotBlank() && realKeys.isNotBlank()) {
+                val fallbackResp = api.getMultiDetail(wd = wd, keys = "")
+                result.addAll(rankDetailResults(fallbackResp.list, wd, ""))
             }
-            if (result.isEmpty()) error = "未找到影片详情"
+            if (result.isEmpty() && wd.isNotBlank()) {
+                val candidateKeys = searchDetailCandidateKeys(api, wd)
+                if (candidateKeys.isNotBlank()) {
+                    val candidateResp = api.getMultiDetail(wd = wd, keys = candidateKeys)
+                    result.addAll(rankDetailResults(candidateResp.list, wd, candidateKeys))
+                }
+            }
+
+            if (result.isNotEmpty()) {
+                details = result
+                DetailMemoryCache.put(wd, realKeys, result)
+                val nameForCache = wd.takeIf { it.isNotBlank() } ?: result.firstOrNull()?.vodName.orEmpty()
+                if (nameForCache.isNotBlank()) {
+                    DetailWarmCache.put(nameForCache, realKeys, result)
+                    DetailWarmCache.put(nameForCache, "", result)
+                }
+            } else if (details.isEmpty()) {
+                error = "未找到影片详情"
+            }
         } catch (e: Exception) {
             error = e.message
         } finally {
@@ -193,10 +261,8 @@ fun DetailScreen(
     val sources = remember(current) { current?.let { parseSources(it) } ?: emptyList() }
     val activeSource = sources.getOrNull(selectedSourceIdx)
 
-    if (loading) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            CircularProgressIndicator(color = Brand400)
-        }
+    if (loading && current == null) {
+        DetailLoadingScreen(onBack = onBack)
     } else if (error != null || current == null) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(16.dp)) {
@@ -306,23 +372,31 @@ fun DetailScreen(
                             }
                         }
                     }
+                    if (loading) {
+                        Spacer(Modifier.height(10.dp))
+                        DetailCompletingCard()
+                    }
 
                     // ── 操作按钮 ──
                     Spacer(Modifier.height(14.dp))
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         Button(
                             onClick = { onPlay(current.siteKey, current.vodId, selectedSourceIdx, 0, current.vodName, realKeys) },
+                            enabled = sources.isNotEmpty(),
                             colors = ButtonDefaults.buttonColors(containerColor = Brand500),
                             shape = RoundedCornerShape(12.dp),
                             modifier = Modifier.weight(1f)
                         ) {
                             Icon(Icons.Filled.PlayArrow, null, Modifier.size(18.dp))
                             Spacer(Modifier.width(6.dp))
-                            Text("立即播放", style = MaterialTheme.typography.labelLarge)
+                            Text(
+                                if (sources.isNotEmpty()) "立即播放" else if (loading) "加载播放源..." else "暂无播放源",
+                                style = MaterialTheme.typography.labelLarge
+                            )
                         }
                         OutlinedButton(
                             onClick = {
-                                favorited = FavoritesStore.toggle(context, current.siteKey, current.vodId)
+                                favorited = FavoritesStore.toggle(context, current)
                             },
                             border = BorderStroke(1.dp, if (favorited) Brand400 else Zinc600),
                             shape = RoundedCornerShape(12.dp)
@@ -335,10 +409,20 @@ fun DetailScreen(
                             Text(if (favorited) "已收藏" else "收藏", color = if (favorited) Brand400 else Zinc400)
                         }
                     }
+                    if (loading && sources.isEmpty()) {
+                        Spacer(Modifier.height(8.dp))
+                        LinearProgressIndicator(
+                            color = Brand400,
+                            trackColor = Zinc800,
+                            modifier = Modifier.fillMaxWidth().height(2.dp)
+                        )
+                    }
 
                     // ── 多源站点切换 ──
-                    if (details.size > 1) {
+                    if (details.isNotEmpty()) {
                         Spacer(Modifier.height(14.dp))
+                        Text("播放源", color = Color.White, style = MaterialTheme.typography.titleSmall)
+                        Spacer(Modifier.height(8.dp))
                         Row(
                             Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -346,7 +430,12 @@ fun DetailScreen(
                             details.forEachIndexed { idx, d ->
                                 FilterChip(
                                     selected = idx == activeIdx,
-                                    onClick = { activeIdx = idx; selectedSourceIdx = 0 },
+                                    onClick = {
+                                        if (details.size > 1) {
+                                            activeIdx = idx
+                                            selectedSourceIdx = 0
+                                        }
+                                    },
                                     label = {
                                         Text(
                                             d.siteName.takeIf { it.isNotBlank() } ?: d.siteKey,
@@ -398,35 +487,6 @@ fun DetailScreen(
                         if (content.length > 200) {
                             TextButton(onClick = { expanded = !expanded }) {
                                 Text(if (expanded) "收起" else "展开全文", color = Brand400, fontSize = 12.sp)
-                            }
-                        }
-                    }
-
-                    // ── 播放源选择 ──
-                    if (sources.size > 1) {
-                        Spacer(Modifier.height(14.dp))
-                        Text("播放线路", color = Color.White, style = MaterialTheme.typography.titleSmall)
-                        Spacer(Modifier.height(8.dp))
-                        Row(
-                            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            sources.forEachIndexed { idx, src ->
-                                FilterChip(
-                                    selected = idx == selectedSourceIdx,
-                                    onClick = { selectedSourceIdx = idx },
-                                    label = {
-                                        Text(
-                                            "${src.name} (${src.episodes.size}集)",
-                                            fontSize = 12.sp,
-                                            color = if (idx == selectedSourceIdx) Brand400 else Zinc400
-                                        )
-                                    },
-                                    colors = FilterChipDefaults.filterChipColors(
-                                        selectedContainerColor = Brand400.copy(alpha = 0.15f)
-                                    ),
-                                    shape = RoundedCornerShape(8.dp)
-                                )
                             }
                         }
                     }
@@ -490,10 +550,142 @@ private fun parseSources(detail: MediaDetail): List<PlaySource> {
         val episodes = part.split("#").filter { it.isNotBlank() }.map { ep ->
             val idx = ep.indexOf("$")
             if (idx == -1) PlayEpisode(ep, ep) else PlayEpisode(ep.substring(0, idx), ep.substring(idx + 1))
-        }
+        }.filter { isM3u8Url(it.url) }
         val rawName = fromParts.getOrElse(i) { "线路${i + 1}" }
         PlaySource(formatSourceName(rawName.trim(), i, detail.siteKey), episodes)
     }.filter { it.episodes.isNotEmpty() }
+}
+
+private fun isM3u8Url(url: String): Boolean =
+    url.substringBefore('?').substringBefore('#').endsWith(".m3u8", ignoreCase = true) ||
+        url.contains(".m3u8?", ignoreCase = true) ||
+        url.contains(".m3u8#", ignoreCase = true)
+
+@Composable
+private fun DetailLoadingScreen(onBack: () -> Unit) {
+    val shimmer by rememberInfiniteTransition(label = "detailLoadingShimmer").animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 900),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "detailLoadingAlpha"
+    )
+    Column(Modifier.fillMaxSize().background(Zinc950)) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(16f / 9f)
+                .background(Zinc900)
+        ) {
+            IconButton(
+                onClick = onBack,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(12.dp)
+                    .size(36.dp)
+                    .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(10.dp))
+            ) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, null, tint = Color.White, modifier = Modifier.size(20.dp))
+            }
+            Box(
+                Modifier
+                    .align(Alignment.Center)
+                    .size(44.dp)
+                    .background(Brand400.copy(alpha = 0.12f * shimmer), CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator(color = Brand400, strokeWidth = 2.dp, modifier = Modifier.size(24.dp))
+            }
+        }
+
+        Column(Modifier.padding(horizontal = 16.dp, vertical = 16.dp)) {
+            SkeletonLine(widthFraction = 0.72f, height = 24.dp, alpha = shimmer)
+            Spacer(Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                SkeletonLine(widthFraction = 0.18f, height = 18.dp, alpha = shimmer)
+                SkeletonLine(widthFraction = 0.22f, height = 18.dp, alpha = shimmer)
+                SkeletonLine(widthFraction = 0.20f, height = 18.dp, alpha = shimmer)
+            }
+            Spacer(Modifier.height(16.dp))
+            Surface(
+                color = Brand400.copy(alpha = 0.10f),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    CircularProgressIndicator(color = Brand400, strokeWidth = 2.dp, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(10.dp))
+                    Text("正在加载影片详情和播放源...", color = Brand400, fontSize = 13.sp)
+                }
+            }
+            Spacer(Modifier.height(16.dp))
+            repeat(3) { idx ->
+                SkeletonLine(
+                    widthFraction = when (idx) {
+                        0 -> 0.96f
+                        1 -> 0.88f
+                        else -> 0.62f
+                    },
+                    height = 13.dp,
+                    alpha = shimmer
+                )
+                Spacer(Modifier.height(8.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun DetailCompletingCard() {
+    val pulse by rememberInfiniteTransition(label = "detailCompletingPulse").animateFloat(
+        initialValue = 0.45f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 850),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "detailCompletingAlpha"
+    )
+    Surface(
+        color = Brand400.copy(alpha = 0.10f),
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                Modifier
+                    .size(24.dp)
+                    .background(Brand400.copy(alpha = 0.12f * pulse), CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator(modifier = Modifier.size(15.dp), color = Brand400, strokeWidth = 2.dp)
+            }
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text("正在补全详情和播放源", color = Brand400, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                Text("页面可先浏览，播放源加载完成后即可播放", color = Zinc500, fontSize = 11.sp, maxLines = 1)
+            }
+        }
+    }
+}
+
+@Composable
+private fun SkeletonLine(widthFraction: Float, height: androidx.compose.ui.unit.Dp, alpha: Float) {
+    Box(
+        Modifier
+            .fillMaxWidth(widthFraction)
+            .height(height)
+            .clip(RoundedCornerShape(6.dp))
+            .background(Zinc800.copy(alpha = 0.45f + alpha * 0.28f))
+    )
 }
 
 private fun rankDetailResults(list: List<MediaDetail>, expectedTitle: String, keys: String): List<MediaDetail> {
@@ -519,6 +711,78 @@ private fun rankDetailResults(list: List<MediaDetail>, expectedTitle: String, ke
             .thenByDescending { !it.vodYear.isNullOrBlank() }
             .thenByDescending { !it.vodPlayUrl.isNullOrBlank() }
     )
+}
+
+private suspend fun searchDetailCandidateKeys(api: RanNuanApi, title: String): String {
+    val candidates = streamDetailSearchCandidates(api, title)
+    if (candidates.isEmpty()) return ""
+    return candidates
+        .sortedWith(
+            compareByDescending<MediaItem> { detailTitleScore(title, it.vodName.ifBlank { it.title }) }
+                .thenByDescending { it.vodPic?.startsWith("http") == true || it.cover?.startsWith("http") == true }
+                .thenByDescending { it.vodYear?.toIntOrNull() ?: it.year?.toIntOrNull() ?: 0 }
+        )
+        .filter { it.siteKey.isNotBlank() && it.vodId.isNotBlank() }
+        .take(6)
+        .joinToString(",") { "${it.siteKey}:${it.vodId}" }
+}
+
+private suspend fun streamDetailSearchCandidates(api: RanNuanApi, query: String): List<MediaItem> {
+    val gson = Gson()
+    val itemListType = object : TypeToken<List<MediaItem>>() {}.type
+    val collected = mutableListOf<MediaItem>()
+    var merged: List<MediaItem>? = null
+    val body = withContext(Dispatchers.IO) { api.searchStream(SearchStreamRequest(query)) }
+
+    try {
+        withContext(Dispatchers.IO) {
+            val reader = body.byteStream().bufferedReader(Charsets.UTF_8)
+            while (true) {
+                currentCoroutineContext().ensureActive()
+                val line = reader.readLine() ?: break
+                if (!line.startsWith("data: ")) continue
+                val event = runCatching {
+                    JsonParser().parse(line.removePrefix("data: ").trim()).asJsonObject
+                }.getOrNull() ?: continue
+                when (event.getString("type")) {
+                    "videos" -> collected.addAll(event.readMediaItems(gson, itemListType))
+                    "merged" -> merged = event.readMediaItems(gson, itemListType)
+                }
+            }
+        }
+    } finally {
+        body.close()
+    }
+
+    return dedupeMediaItems(merged ?: collected)
+}
+
+private fun detailTitleScore(expected: String, actual: String): Int {
+    val expectedNorm = normalizeDetailTitle(expected)
+    val actualNorm = normalizeDetailTitle(actual)
+    if (expectedNorm.isBlank() || actualNorm.isBlank()) return 0
+    return when {
+        expectedNorm == actualNorm -> 100
+        actualNorm.startsWith(expectedNorm) || expectedNorm.startsWith(actualNorm) -> 76
+        actualNorm.contains(expectedNorm) || expectedNorm.contains(actualNorm) -> 58
+        else -> 0
+    }
+}
+
+private fun dedupeMediaItems(list: List<MediaItem>): List<MediaItem> {
+    val seen = HashSet<String>()
+    return list.filter { item ->
+        val key = "${item.siteKey.ifBlank { item.siteName }}:${item.vodId.ifBlank { item.vodName.ifBlank { item.title } }}"
+        seen.add(key)
+    }
+}
+
+private fun JsonObject.getString(key: String): String? =
+    if (has(key) && !get(key).isJsonNull) get(key).asString else null
+
+private fun JsonObject.readMediaItems(gson: Gson, itemListType: java.lang.reflect.Type): List<MediaItem> {
+    if (!has("videos") || get("videos").isJsonNull) return emptyList()
+    return runCatching { gson.fromJson<List<MediaItem>>(get("videos"), itemListType) }.getOrDefault(emptyList())
 }
 
 private fun normalizeDetailTitle(value: String?): String =

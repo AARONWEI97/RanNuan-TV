@@ -1,14 +1,10 @@
 package com.rannuan.tv.ui.screens.home
 
 import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.spring
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -36,6 +32,7 @@ import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.TheaterComedy
 import androidx.compose.material.icons.outlined.Tv
 import androidx.compose.material.icons.outlined.ViewModule
+import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -65,14 +62,18 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.rannuan.tv.data.api.RanNuanApi
 import com.rannuan.tv.data.model.DoubanHomeData
 import com.rannuan.tv.data.model.MediaItem
+import com.rannuan.tv.ui.screens.detail.putDetailPreview
 import com.rannuan.tv.ui.theme.Brand400
 import com.rannuan.tv.ui.theme.Brand500
 import com.rannuan.tv.ui.theme.ShapeCard
 import com.rannuan.tv.ui.theme.ShapeCardLarge
 import com.rannuan.tv.ui.theme.ShapePill
+import com.rannuan.tv.ui.theme.Zinc700
+import com.rannuan.tv.ui.theme.Zinc800
 import com.rannuan.tv.ui.theme.Zinc300
 import com.rannuan.tv.ui.theme.Zinc400
 import com.rannuan.tv.ui.theme.Zinc500
@@ -82,6 +83,7 @@ import com.rannuan.tv.ui.util.ImageProxy
 import kotlinx.coroutines.delay
 import java.net.URLEncoder
 import kotlin.math.abs
+import androidx.compose.ui.platform.LocalContext
 
 // 分类配置数据
 data class CategoryConfig(
@@ -214,7 +216,7 @@ fun HomeScreen(api: RanNuanApi, onNavigate: (String) -> Unit) {
                 }
 
                 // ── 4. 底部留白（避免被 NavigationBar 遮挡） ──
-                Spacer(Modifier.height(80.dp))
+                Spacer(Modifier.height(128.dp))
             }
         }
     }
@@ -458,14 +460,13 @@ private fun detailRouteFor(item: MediaItem): String {
     val title = item.vodName.takeIf { it.isNotBlank() } ?: item.title
     val encodedTitle = URLEncoder.encode(title, "UTF-8")
     return when {
-        item.siteKey.isNotBlank() && item.vodId.isNotBlank() -> {
-            "detail/${item.siteKey}/${item.vodId}?name=$encodedTitle"
-        }
         !item.sites.isNullOrEmpty() -> {
             val keys = item.sites.joinToString(",") { "${it.key}:${it.id}" }
+            putDetailPreview(item, title, keys)
             "detail/source/$encodedTitle?keys=$keys"
         }
         title.isNotBlank() -> {
+            putDetailPreview(item, title, "")
             "detail/source/$encodedTitle?keys="
         }
         else -> "search"
@@ -478,27 +479,32 @@ private fun detailRouteFor(item: MediaItem): String {
 
 @Composable
 fun MediaCard(item: MediaItem, onClick: (MediaItem) -> Unit) {
-    val interactionSource = remember { MutableInteractionSource() }
-    val isPressed by interactionSource.collectIsPressedAsState()
-    val scale by animateFloatAsState(
-        targetValue = if (isPressed) 0.96f else 1f,
-        animationSpec = spring(dampingRatio = 0.4f, stiffness = 400f)
-    )
-
+    val context = LocalContext.current
     val cardWidth = 115.dp
+    val title = item.title.ifBlank { item.vodName }
+    val subTitle = buildString {
+        item.year?.let { append(it) }
+        if (!item.year.isNullOrBlank() && !item.type.isNullOrBlank()) append(" · ")
+        item.type?.let { append(it) }
+        if (isBlank()) {
+            item.vodYear?.takeIf { it.isNotBlank() }?.let { append(it) }
+            val typeName = item.typeName?.takeIf { it.isNotBlank() }
+            if (isNotBlank() && typeName != null) append(" · ")
+            typeName?.let { append(it) }
+        }
+    }
+    val posterRequest = remember(item.cover, item.vodPic) {
+        ImageRequest.Builder(context)
+            .data(ImageProxy.proxy(item.cover ?: item.vodPic))
+            .crossfade(false)
+            .size(240, 360)
+            .build()
+    }
 
     Column(
         modifier = Modifier
             .width(cardWidth)
-            .graphicsLayer {
-                scaleX = scale
-                scaleY = scale
-            }
-            .clickable(
-                interactionSource = interactionSource,
-                indication = null,
-                onClick = { onClick(item) }
-            )
+            .clickable { onClick(item) }
     ) {
         // 海报区
         Box(
@@ -506,10 +512,19 @@ fun MediaCard(item: MediaItem, onClick: (MediaItem) -> Unit) {
                 .fillMaxWidth()
                 .aspectRatio(2f / 3f)
                 .clip(ShapeCard)
+                .background(Zinc800)
                 .shadow(4.dp, ShapeCard)
         ) {
+            Icon(
+                Icons.Outlined.Image,
+                contentDescription = null,
+                tint = Zinc700,
+                modifier = Modifier
+                    .size(30.dp)
+                    .align(Alignment.Center)
+            )
             AsyncImage(
-                model = ImageProxy.proxy(item.cover ?: item.vodPic),
+                model = posterRequest,
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize()
@@ -538,7 +553,7 @@ fun MediaCard(item: MediaItem, onClick: (MediaItem) -> Unit) {
 
         // 标题
         Text(
-            text = item.title.ifBlank { item.vodName },
+            text = title,
             color = Zinc300,
             style = MaterialTheme.typography.labelMedium,
             maxLines = 1,
@@ -547,11 +562,6 @@ fun MediaCard(item: MediaItem, onClick: (MediaItem) -> Unit) {
         )
 
         // 副信息（年份/地区）
-        val subTitle = buildString {
-            item.year?.let { append(it) }
-            if (!item.year.isNullOrBlank() && !item.type.isNullOrBlank()) append(" · ")
-            item.type?.let { append(it) }
-        }
         if (subTitle.isNotBlank()) {
             Text(
                 text = subTitle,

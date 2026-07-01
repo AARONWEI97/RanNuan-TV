@@ -109,8 +109,10 @@ fun ProfileScreen(onNavigate: (String) -> Unit) {
 
     // ── 收藏 ──
     var favoriteKeys by remember { mutableStateOf(FavoritesStore.getFavoriteKeys(context)) }
-    var favoriteDetails by remember { mutableStateOf(FavoriteCache.get(favoriteKeys) ?: emptyList()) }
-    var favLoading by remember { mutableStateOf(favoriteKeys.isNotEmpty() && FavoriteCache.get(favoriteKeys) == null) }
+    var favoriteDetails by remember {
+        mutableStateOf(FavoriteCache.get(favoriteKeys) ?: FavoritesStore.getFavoriteSnapshots(context))
+    }
+    var favLoading by remember { mutableStateOf(false) }
 
     // 每次进入刷新（有缓存则跳过 API）
     LaunchedEffect(Unit) {
@@ -124,12 +126,19 @@ fun ProfileScreen(onNavigate: (String) -> Unit) {
             favoriteDetails = cached
             favLoading = false
         } else if (keys.isNotEmpty()) {
-            favLoading = true
+            val snapshots = FavoritesStore.getFavoriteSnapshots(context)
+            favoriteDetails = snapshots.ifEmpty { keys.mapNotNull { it.toPlaceholderDetail() } }
+            favLoading = false
             try {
                 val keysParam = keys.joinToString(",")
                 val resp = api.getMultiDetail(wd = "", keys = keysParam)
-                favoriteDetails = resp.list
-                FavoriteCache.put(keys, resp.list)
+                if (resp.list.isNotEmpty()) {
+                    favoriteDetails = resp.list
+                    resp.list.forEach { FavoritesStore.saveSnapshot(context, it) }
+                    FavoriteCache.put(keys, resp.list)
+                } else if (snapshots.isNotEmpty()) {
+                    FavoriteCache.put(keys, snapshots)
+                }
             } catch (_: Exception) { }
             favLoading = false
         } else {
@@ -226,6 +235,17 @@ fun ProfileScreen(onNavigate: (String) -> Unit) {
             })
         }
     }
+}
+
+private fun String.toPlaceholderDetail(): MediaDetail? {
+    val parts = split(":", limit = 2)
+    if (parts.size != 2 || parts[0].isBlank() || parts[1].isBlank()) return null
+    return MediaDetail(
+        vodId = parts[1],
+        vodName = "收藏影片",
+        siteKey = parts[0],
+        siteName = parts[0]
+    )
 }
 
 @Composable

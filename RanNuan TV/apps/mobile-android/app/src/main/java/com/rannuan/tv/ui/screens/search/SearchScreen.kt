@@ -21,9 +21,16 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.google.gson.Gson
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
+import com.google.gson.reflect.TypeToken
 import com.rannuan.tv.data.api.RanNuanApi
+import com.rannuan.tv.data.api.SearchStreamRequest
 import com.rannuan.tv.data.model.MediaItem
+import com.rannuan.tv.data.model.SiteInfo
 import com.rannuan.tv.ui.screens.home.MediaCard
+import com.rannuan.tv.ui.screens.detail.putDetailPreview
 import com.rannuan.tv.ui.theme.*
 import com.rannuan.tv.ui.theme.component.GlassCard
 import com.rannuan.tv.ui.util.SearchHistoryStore
@@ -109,8 +116,30 @@ fun SearchScreen(api: RanNuanApi, onNavigate: (String) -> Unit, initialQuery: St
 
             searchJob = scope.launch {
                 try {
-                    val data = api.search(normalizedQuery)
-                    val ranked = rankSearchResults(normalizedQuery, data.list)
+                    val streamResults = try {
+                        streamSearchResults(
+                            api = api,
+                            query = normalizedQuery,
+                            onProgress = { completed, total, phase ->
+                                progressText = when {
+                                    phase == "scanning" -> "正在扩大搜索范围..."
+                                    total > 0 -> "搜索中 $completed/$total"
+                                    else -> "搜索中..."
+                                }
+                            },
+                            onVideos = { partial ->
+                                val rankedPartial = rankSearchResults(normalizedQuery, mergeSearchResults(partial))
+                                results = rankedPartial
+                                progressText = "已找到 ${rankedPartial.size} 个结果"
+                            }
+                        )
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        val data = api.search(normalizedQuery)
+                        data.list
+                    }
+                    val ranked = rankSearchResults(normalizedQuery, mergeSearchResults(streamResults))
                     SearchMemoryCache.put(normalizedQuery, ranked)
                     results = ranked
                     progressText = "找到 ${ranked.size} 个结果"
@@ -130,10 +159,19 @@ fun SearchScreen(api: RanNuanApi, onNavigate: (String) -> Unit, initialQuery: St
         progressText = "已取消"
     }
 
-    // 提取所有来源（使用 siteName，回退到 siteKey）
-    val sites = results.map { it.siteName.takeIf { n -> n.isNotBlank() } ?: it.siteKey }.distinct()
+    // 提取所有来源（合并结果里可能包含多个 sites）
+    val sites = results
+        .flatMap { it.searchSiteLabels() }
+        .filter { it.isNotBlank() }
+        .distinct()
     val filtered = results
-        .let { list -> if (selectedSite != null) list.filter { (it.siteName.takeIf { n -> n.isNotBlank() } ?: it.siteKey) == selectedSite } else list }
+        .let { list ->
+            if (selectedSite != null) {
+                list.filter { it.searchSiteLabels().contains(selectedSite) }
+            } else {
+                list
+            }
+        }
         .let { list ->
             when (sortBy) {
                 "name" -> list.sortedBy { it.vodName }
@@ -347,15 +385,24 @@ fun SearchScreen(api: RanNuanApi, onNavigate: (String) -> Unit, initialQuery: St
                 columns = GridCells.Fixed(3),
                 modifier = Modifier.padding(horizontal = 12.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+                contentPadding = PaddingValues(bottom = 96.dp)
             ) {
                 items(filtered.size, key = { filtered[it].vodId + filtered[it].siteKey }) { idx ->
                     val item = filtered[idx]
-                    val route = if (item.sites != null && (item.sites?.size ?: 0) > 1) {
-                        val k = item.sites.joinToString(",") { "${it.key}:${it.id}" }
+                    val sourceKeys = item.sites
+                        ?.filter { it.key.isNotBlank() && it.id.isNotBlank() }
+                        .orEmpty()
+                    val route = if (sourceKeys.isNotEmpty()) {
+                        val k = sourceKeys.joinToString(",") { "${it.key}:${it.id}" }
+                        putDetailPreview(item, item.vodName, k)
                         "detail/source/${URLEncoder.encode(item.vodName, "UTF-8")}?keys=$k"
-                    } else {
+                    } else if (item.siteKey.isNotBlank() && item.vodId.isNotBlank()) {
+                        putDetailPreview(item, item.vodName, "${item.siteKey}:${item.vodId}")
                         "detail/${item.siteKey}/${item.vodId}"
+                    } else {
+                        putDetailPreview(item, item.vodName, "")
+                        "detail/source/${URLEncoder.encode(item.vodName, "UTF-8")}?keys="
                     }
                     MediaCard(item = item) { onNavigate(route) }
                 }
@@ -383,4 +430,140 @@ private fun rankSearchResults(query: String, list: List<MediaItem>): List<MediaI
             .thenByDescending { contains(it.vodName) }
             .thenByDescending { it.vodYear?.toIntOrNull() ?: 0 }
     )
+}
+
+private suspend fun streamSearchResults(
+    api: RanNuanApi,
+    query: String,
+    onProgress: suspend (completed: Int, total: Int, phase: String?) -> Unit,
+    onVideos: suspend (List<MediaItem>) -> Unit
+): List<MediaItem> = coroutineScope {
+    val gson = Gson()
+    val itemListType = object : TypeToken<List<MediaItem>>() {}.type
+    val collected = mutableListOf<MediaItem>()
+    var merged: List<MediaItem>? = null
+
+    val body = withContext(Dispatchers.IO) { api.searchStream(SearchStreamRequest(query)) }
+    try {
+        withContext(Dispatchers.IO) {
+            val reader = body.byteStream().bufferedReader(Charsets.UTF_8)
+            while (true) {
+                currentCoroutineContext().ensureActive()
+                val line = reader.readLine() ?: break
+                if (!line.startsWith("data: ")) continue
+                val payload = line.removePrefix("data: ").trim()
+                val event = runCatching {
+                    JsonParser().parse(payload).asJsonObject
+                }.getOrNull() ?: continue
+                when (event.getString("type")) {
+                    "videos" -> {
+                        val videos = event.readVideos(gson, itemListType)
+                        if (videos.isNotEmpty()) {
+                            collected.addAll(videos)
+                            val snapshot = mergeSearchResults(collected)
+                            withContext(Dispatchers.Main) { onVideos(snapshot) }
+                        }
+                    }
+                    "merged" -> {
+                        val videos = event.readVideos(gson, itemListType)
+                        if (videos.isNotEmpty()) {
+                            merged = mergeSearchResults(videos)
+                            withContext(Dispatchers.Main) { onVideos(merged.orEmpty()) }
+                        }
+                    }
+                    "progress" -> {
+                        val completed = event.getInt("completedSources")
+                        val total = event.getInt("totalSources")
+                        val phase = event.getString("phase")
+                        withContext(Dispatchers.Main) { onProgress(completed, total, phase) }
+                    }
+                }
+            }
+        }
+    } finally {
+        body.close()
+    }
+
+    merged ?: mergeSearchResults(collected)
+}
+
+private fun JsonObject.getString(key: String): String? =
+    if (has(key) && !get(key).isJsonNull) get(key).asString else null
+
+private fun JsonObject.getInt(key: String): Int =
+    if (has(key) && !get(key).isJsonNull) runCatching { get(key).asInt }.getOrDefault(0) else 0
+
+private fun JsonObject.readVideos(gson: Gson, itemListType: java.lang.reflect.Type): List<MediaItem> {
+    if (!has("videos") || get("videos").isJsonNull) return emptyList()
+    return runCatching { gson.fromJson<List<MediaItem>>(get("videos"), itemListType) }.getOrDefault(emptyList())
+}
+
+private fun dedupeSearchResults(list: List<MediaItem>): List<MediaItem> {
+    val seen = HashSet<String>()
+    return list.filter { item ->
+        val key = "${item.siteKey.ifBlank { item.siteName }}:${item.vodId.ifBlank { item.vodName }}"
+        seen.add(key)
+    }
+}
+
+private fun mergeSearchResults(list: List<MediaItem>): List<MediaItem> {
+    if (list.isEmpty()) return emptyList()
+    return list
+        .groupBy { searchMergeKey(it.vodName.ifBlank { it.title }) }
+        .values
+        .map { group ->
+            val sorted = group.sortedWith(
+                compareByDescending<MediaItem> { hasUsablePoster(it) }
+                    .thenByDescending { it.siteKey == "bfzy" }
+                    .thenByDescending { it.vodYear?.toIntOrNull() ?: it.year?.toIntOrNull() ?: 0 }
+            )
+            val best = sorted.first()
+            best.copy(sites = sorted.collectSites())
+        }
+        .filter { it.vodName.isNotBlank() || it.title.isNotBlank() }
+}
+
+private fun List<MediaItem>.collectSites(): List<SiteInfo> {
+    val map = LinkedHashMap<String, SiteInfo>()
+    forEach { item ->
+        item.sites?.forEach { site ->
+            if (site.key.isNotBlank() && site.id.isNotBlank()) map.putIfAbsent(site.key, site)
+        }
+        if (item.siteKey.isNotBlank() && item.vodId.isNotBlank()) {
+            map.putIfAbsent(
+                item.siteKey,
+                SiteInfo(
+                    key = item.siteKey,
+                    name = item.siteName.ifBlank { item.siteKey },
+                    id = item.vodId
+                )
+            )
+        }
+    }
+    return map.values.toList()
+}
+
+private fun searchMergeKey(title: String): String {
+    val raw = title
+        .lowercase()
+        .replace(Regex("[·・\\s\\-\\[\\]【】]"), "")
+    val normalized = raw
+        .replace(Regex("[（(].*?[）)]"), "")
+        .replace(Regex("\\d{4}"), "")
+        .replace(Regex("第[一二三四五六七八九十\\d]+季"), "")
+    return (normalized.take(15).ifBlank { raw.take(15) }).ifBlank { title }
+}
+
+private fun hasUsablePoster(item: MediaItem): Boolean =
+    item.vodPic?.startsWith("http") == true || item.cover?.startsWith("http") == true
+
+private fun MediaItem.searchSiteLabels(): Set<String> {
+    val labels = linkedSetOf<String>()
+    sites?.forEach {
+        if (it.name.isNotBlank()) labels += it.name
+        if (it.key.isNotBlank()) labels += it.key
+    }
+    if (siteName.isNotBlank()) labels += siteName
+    if (siteKey.isNotBlank()) labels += siteKey
+    return labels
 }

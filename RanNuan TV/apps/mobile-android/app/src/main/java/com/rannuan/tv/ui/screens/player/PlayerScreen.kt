@@ -1460,7 +1460,7 @@ fun PlayerScreen(
                     }
 
                     // ── 播放源（站点）──
-                    if (sourceDetails.size > 1) {
+                    if (sourceDetails.isNotEmpty()) {
                         item {
                             Spacer(Modifier.height(12.dp))
                             Text("播放源", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
@@ -1473,7 +1473,9 @@ fun PlayerScreen(
                                     val selected = sourceDetail.siteKey == d.siteKey && sourceDetail.vodId == d.vodId
                                     FilterChip(
                                         selected = selected,
-                                        onClick = { switchToDetail(sourceDetail) },
+                                        onClick = {
+                                            if (sourceDetails.size > 1) switchToDetail(sourceDetail)
+                                        },
                                         label = {
                                             Text(
                                                 sourceDetail.siteName.takeIf { it.isNotBlank() } ?: sourceDetail.siteKey,
@@ -1489,32 +1491,6 @@ fun PlayerScreen(
                                             labelColor = Zinc400
                                         ),
                                         shape = ShapeChip
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    // ── 播放线路 ──
-                    if (sources.isNotEmpty()) {
-                        item {
-                            Spacer(Modifier.height(12.dp))
-                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                                Text("播放线路", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                                Spacer(Modifier.weight(1f))
-                                Text("${currentSrc + 1}/${sources.size}", color = Zinc500, fontSize = 11.sp)
-                            }
-                            Spacer(Modifier.height(8.dp))
-                            Row(
-                                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                sources.forEachIndexed { idx, src ->
-                                    CompactEpisodeChip(
-                                        text = src.name,
-                                        selected = idx == currentSrc,
-                                        onClick = { switchToLine(idx) },
-                                        minWidth = 86.dp
                                     )
                                 }
                             }
@@ -1664,11 +1640,8 @@ fun PlayerScreen(
             ) {
                 Box(Modifier.heightIn(max = 242.dp)) {
                     EpisodeSheetContent(
-                        sources = sources,
                         activeSource = activeSource,
-                        currentSrc = currentSrc,
                         currentEp = currentEp,
-                        onSourceSelect = { idx -> switchToLine(idx) },
                         onEpisodeSelect = { idx -> switchToEpisode(idx); showEpisodeSheet = false }
                     )
                 }
@@ -2120,11 +2093,8 @@ private fun OverlayAnimatedVisibility(
 /** 选集底部 Sheet 内容 — 移动端优化：紧凑行列、去标题、高触达 */
 @Composable
 private fun EpisodeSheetContent(
-    sources: List<PlaySource>,
     activeSource: PlaySource,
-    currentSrc: Int,
     currentEp: Int,
-    onSourceSelect: (Int) -> Unit,
     onEpisodeSelect: (Int) -> Unit
 ) {
     val gridState = rememberLazyGridState()
@@ -2166,27 +2136,6 @@ private fun EpisodeSheetContent(
                 )
             }
             Text("${currentEp + 1}/${activeSource.episodes.size}", color = Brand400, fontSize = 11.sp)
-        }
-
-        // ── 播放线路（横滑）──
-        if (sources.size > 1) {
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState())
-                    .padding(horizontal = 16.dp, vertical = 2.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                sources.forEachIndexed { idx, src ->
-                    CompactEpisodeChip(
-                        text = src.name,
-                        selected = idx == currentSrc,
-                        onClick = { onSourceSelect(idx) },
-                        minWidth = 72.dp
-                    )
-                }
-            }
-            Spacer(Modifier.height(6.dp))
         }
 
         if (pageCount > 1) {
@@ -2781,7 +2730,7 @@ private fun parseSources(d: MediaDetail): List<PlaySource> {
         val eps = part.split("#").filter { it.isNotBlank() }.map { ep ->
             val idx = ep.indexOf("$")
             if (idx == -1) PlayEpisode(ep, ep) else PlayEpisode(ep.substring(0, idx), ep.substring(idx + 1))
-        }
+        }.filter { isM3u8Url(it.url) }
         val rawName = fromParts.getOrElse(i) { "线路${i + 1}" }.trim()
         PlaySource(formatSourceName(rawName, i, d.siteKey), eps)
     }.filter { it.episodes.isNotEmpty() }

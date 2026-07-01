@@ -1,7 +1,8 @@
 package com.rannuan.tv.ui.navigation
 
-import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.GridView
 import androidx.compose.material.icons.outlined.Home
@@ -29,6 +30,7 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.rannuan.tv.data.api.RanNuanApi
 import com.rannuan.tv.ui.screens.category.CategoryScreen
+import com.rannuan.tv.ui.screens.category.prefetchCategoryFirstPages
 import com.rannuan.tv.ui.screens.detail.DetailScreen
 import com.rannuan.tv.ui.screens.home.HomeScreen
 import com.rannuan.tv.ui.screens.player.PlayerScreen
@@ -65,6 +67,10 @@ fun MainNavHost(api: RanNuanApi) {
     val navController = rememberNavController()
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = navBackStackEntry?.destination?.route
+
+    LaunchedEffect(Unit) {
+        prefetchCategoryFirstPages(api)
+    }
 
     val bottomBarRoutes = listOf("home", "category", "search", "profile")
     // route 是模式串(如 "category/{type}")，不能用精确匹配，用前缀匹配
@@ -119,11 +125,13 @@ fun MainNavHost(api: RanNuanApi) {
                 }
             }
         }
-    ) { padding ->
+    ) { _ ->
         NavHost(
             navController = navController,
             startDestination = Screen.Home.route,
-            modifier = Modifier.padding(padding)
+            modifier = Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
         ) {
             composable(Screen.Home.route) {
                 HomeScreen(api = api, onNavigate = { navController.navigate(it) })

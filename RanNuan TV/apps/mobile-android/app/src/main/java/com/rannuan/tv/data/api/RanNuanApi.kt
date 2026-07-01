@@ -6,6 +6,7 @@ import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import retrofit2.http.*
+import retrofit2.http.Streaming
 import com.rannuan.tv.data.model.*
 import java.util.concurrent.TimeUnit
 
@@ -21,6 +22,10 @@ interface RanNuanApi {
     // ========== 搜索 ==========
     @GET("/api/search")
     suspend fun search(@Query("wd") query: String): ApiListResponse<MediaItem>
+
+    @Streaming
+    @POST("/api/search-stream")
+    suspend fun searchStream(@Body body: SearchStreamRequest): okhttp3.ResponseBody
 
     // ========== 分类 ==========
     @POST("/api/category")
@@ -84,4 +89,8 @@ data class CategoryRequest(
     val page: Int = 1,
     val pageSize: Int = 20,
     val subType: String? = null
+)
+
+data class SearchStreamRequest(
+    val wd: String
 )
