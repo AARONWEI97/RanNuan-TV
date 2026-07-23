@@ -13,7 +13,7 @@ interface Props {
   episodes?: { title: string; url: string; index?: number }[];
   currentEpisodeIndex?: number;
   currentSourceIndex?: number;
-  savedPosition?: number; // 上次播放位置（秒），>30s 时弹出续播 Dialog
+  savedPosition?: number; // 上次播放位置（秒）
   onBack?: () => void;
   onSourceChange?: (url: string) => void;
   onEpisodeChange?: (index: number) => void;
@@ -69,6 +69,8 @@ export default function VideoPlayer({
   const skipTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastClickRef = useRef(0);
   const clickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const resumeTargetRef = useRef(savedPosition);
+  const resumeReadyRef = useRef(savedPosition <= 0);
 
   // --- HLS Player ---
   useHlsPlayer({ videoRef: videoRef as React.RefObject<HTMLVideoElement>, src, autoPlay: true, onError });
@@ -76,12 +78,42 @@ export default function VideoPlayer({
   // --- 断点续播（静默 seek 到上次位置） ---
   useEffect(() => {
     const v = videoRef.current;
-    if (v && savedPosition > 0) {
-      const handler = () => { if (Math.abs(v.currentTime - savedPosition) > 0.5) v.currentTime = savedPosition; };
-      v.addEventListener('loadedmetadata', handler, { once: true });
-      return () => v.removeEventListener('loadedmetadata', handler);
+    const target = resumeTargetRef.current;
+    if (!v || target <= 0) {
+      resumeReadyRef.current = true;
+      return;
     }
-  }, [savedPosition]);
+
+    resumeReadyRef.current = false;
+    const applyResumePosition = () => {
+      if (resumeReadyRef.current || v.readyState < HTMLMediaElement.HAVE_METADATA) return;
+      if (Number.isFinite(v.duration) && v.duration <= 0) return;
+
+      const maxPosition = Number.isFinite(v.duration)
+        ? Math.max(0, v.duration - 0.5)
+        : target;
+      const resumePosition = Math.min(target, maxPosition);
+      if (resumePosition <= 0) return;
+
+      try {
+        v.currentTime = resumePosition;
+        setCurrentTime(resumePosition);
+        resumeReadyRef.current = true;
+      } catch {
+        // 某些流在 loadedmetadata 时尚不可 seek，等待 canplay/durationchange 重试。
+      }
+    };
+
+    applyResumePosition();
+    v.addEventListener('loadedmetadata', applyResumePosition);
+    v.addEventListener('durationchange', applyResumePosition);
+    v.addEventListener('canplay', applyResumePosition);
+    return () => {
+      v.removeEventListener('loadedmetadata', applyResumePosition);
+      v.removeEventListener('durationchange', applyResumePosition);
+      v.removeEventListener('canplay', applyResumePosition);
+    };
+  }, [src]);
 
   // --- 音量/倍速持久化 ---
   useEffect(() => { try { localStorage.setItem('player-volume', String(volume)); } catch {} }, [volume]);
@@ -168,7 +200,9 @@ export default function VideoPlayer({
       setCurrentTime(v.currentTime);
       setDuration(v.duration || 0);
       if (v.buffered.length > 0) setBuffered(v.buffered.end(v.buffered.length - 1));
-      onTimeUpdate?.(v.currentTime, v.duration || 0);
+      if (resumeReadyRef.current) {
+        onTimeUpdate?.(v.currentTime, v.duration || 0);
+      }
     }
   }, [onTimeUpdate]);
 

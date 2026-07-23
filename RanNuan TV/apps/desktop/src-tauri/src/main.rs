@@ -18,6 +18,24 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 /// 存储 node 后端 PID，退出时按 PID 杀进程
 struct ServerPid(Mutex<Option<u32>>);
 
+fn stop_server(app: &tauri::AppHandle) {
+    if let Some(pid_state) = app.try_state::<ServerPid>() {
+        if let Some(pid) = *pid_state.0.lock().unwrap() {
+            let mut cmd = Command::new("taskkill");
+            cmd.args(["/F", "/PID", &pid.to_string()]);
+            #[cfg(target_os = "windows")]
+            cmd.creation_flags(CREATE_NO_WINDOW);
+            let _ = cmd.output();
+        }
+    }
+}
+
+#[tauri::command]
+fn exit_app(app: tauri::AppHandle) {
+    stop_server(&app);
+    app.exit(0);
+}
+
 fn strip_verbatim(path: &std::path::Path) -> PathBuf {
     let s = path.to_string_lossy();
     let stripped = s.strip_prefix("\\\\?\\").unwrap_or(&s);
@@ -26,14 +44,18 @@ fn strip_verbatim(path: &std::path::Path) -> PathBuf {
 
 fn find_server_js(app: &tauri::App) -> Option<PathBuf> {
     // 1. Tauri 资源目录（生产打包）
-    let resource_server = app.path().resource_dir().ok()?.join("server").join("server.js");
+    let resource_server = app
+        .path()
+        .resource_dir()
+        .ok()?
+        .join("server")
+        .join("server.js");
     if resource_server.exists() {
         println!("[Tauri] 生产路径: {:?}", resource_server);
         return Some(resource_server);
     }
     // 2. 开发路径（CARGO_MANIFEST_DIR 相对）
-    let dev_server = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../server/server.js");
+    let dev_server = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../server/server.js");
     if dev_server.exists() {
         println!("[Tauri] 开发路径: {:?}", dev_server);
         return Some(dev_server);
@@ -49,7 +71,10 @@ fn find_server_js(app: &tauri::App) -> Option<PathBuf> {
         }
     }
     // 4. CWD 降级
-    let cwd_server = std::env::current_dir().ok()?.join("server").join("server.js");
+    let cwd_server = std::env::current_dir()
+        .ok()?
+        .join("server")
+        .join("server.js");
     if cwd_server.exists() {
         println!("[Tauri] CWD路径: {:?}", cwd_server);
         return Some(cwd_server);
@@ -71,38 +96,28 @@ fn main() {
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
                 .tooltip("冉暖TV")
-                .on_menu_event(|app, event| {
-                    match event.id().as_ref() {
-                        "toggle" => {
-                            if let Some(window) = app.get_webview_window("main") {
-                                if window.is_visible().unwrap_or(false) {
-                                    let _ = window.hide();
-                                } else {
-                                    let _ = window.show();
-                                    let _ = window.set_focus();
-                                }
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "toggle" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            if window.is_visible().unwrap_or(false) {
+                                let _ = window.hide();
+                            } else {
+                                let _ = window.show();
+                                let _ = window.set_focus();
                             }
                         }
-                        "quit" => {
-                            // 按 PID 杀后端进程（CREATE_NO_WINDOW 后 WINDOWTITLE 过滤失效）
-                            if let Some(pid_state) = app.try_state::<ServerPid>() {
-                                if let Some(pid) = *pid_state.0.lock().unwrap() {
-                                    let mut cmd = Command::new("taskkill");
-                                    cmd.args(["/F", "/PID", &pid.to_string()]);
-                                    #[cfg(target_os = "windows")]
-                                    cmd.creation_flags(CREATE_NO_WINDOW);
-                                    let _ = cmd.output();
-                                }
-                            }
-                            std::process::exit(0);
-                        }
-                        _ => {}
                     }
+                    "quit" => {
+                        stop_server(app);
+                        app.exit(0);
+                    }
+                    _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
                     if let TrayIconEvent::Click {
                         button: MouseButton::Left,
-                        button_state: MouseButtonState::Up, ..
+                        button_state: MouseButtonState::Up,
+                        ..
                     } = event
                     {
                         let app = tray.app_handle();
@@ -146,6 +161,7 @@ fn main() {
                 api.prevent_close();
             }
         })
+        .invoke_handler(tauri::generate_handler![exit_app])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

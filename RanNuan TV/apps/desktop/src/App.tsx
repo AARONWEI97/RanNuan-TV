@@ -1,5 +1,5 @@
-import { useCallback, useState } from 'react';
-import { Routes, Route } from 'react-router-dom';
+import { useCallback, useEffect, useState } from 'react';
+import { Routes, Route, useNavigate } from 'react-router-dom';
 import Layout from './components/layout/Layout';
 import HomePage from './pages/HomePage';
 import SearchPage from './pages/SearchPage';
@@ -13,11 +13,63 @@ import VarietyPage from './pages/VarietyPage';
 import AnimePage from './pages/AnimePage';
 import ShortDramaPage from './pages/ShortDramaPage';
 import SportsPage from './pages/SportsPage';
+import DonatePage from './pages/DonatePage';
 import SplashScreen from './components/SplashScreen';
+import DisclaimerDialog from './components/dialogs/DisclaimerDialog';
+import DonationDialog from './components/dialogs/DonationDialog';
+import { shouldShowStartupNotice, acknowledgeStartupNotice } from './utils/version';
+
+type DialogState = 'none' | 'disclaimer' | 'donation';
 
 export default function App() {
+  const navigate = useNavigate();
   const [showSplash, setShowSplash] = useState(true);
-  const handleSplashFinish = useCallback(() => setShowSplash(false), []);
+  const [dialog, setDialog] = useState<DialogState>('none');
+
+  const handleSplashFinish = useCallback(() => {
+    setShowSplash(false);
+    // 启动动画结束后，检查是否需要展示免责声明 + 捐赠弹窗
+    if (shouldShowStartupNotice()) {
+      setDialog('disclaimer');
+    }
+  }, []);
+
+  /** 免责声明 —— 同意 */
+  const handleAgree = useCallback(() => setDialog('donation'), []);
+
+  /** 免责声明 —— 退出应用（通过 Rust 同时清理后端进程） */
+  const handleExit = useCallback(async () => {
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      await invoke('exit_app');
+    } catch {
+      // 网页开发环境无法退出宿主进程，关闭弹窗以便继续调试。
+      setDialog('none');
+    }
+  }, []);
+
+  /** 捐赠弹窗 —— 前往捐赠页 */
+  const handleGoDonate = useCallback(() => {
+    acknowledgeStartupNotice();
+    setDialog('none');
+    navigate('/donate');
+  }, [navigate]);
+
+  /** 捐赠弹窗 —— 下次再说 */
+  const handleDonationClose = useCallback(() => {
+    acknowledgeStartupNotice();
+    setDialog('none');
+  }, []);
+
+  // 防止在展示免责声明期间误触发路由/滚动
+  useEffect(() => {
+    if (dialog !== 'none') {
+      document.body.style.overflow = 'hidden';
+    } else {
+      document.body.style.overflow = '';
+    }
+    return () => { document.body.style.overflow = ''; };
+  }, [dialog]);
 
   return (
     <>
@@ -35,10 +87,19 @@ export default function App() {
           <Route path="/anime" element={<AnimePage />} />
           <Route path="/short-drama" element={<ShortDramaPage />} />
           <Route path="/sports" element={<SportsPage />} />
+          <Route path="/donate" element={<DonatePage />} />
           <Route path="/player/:siteKey/:id" element={<PlayerPage />} />
         </Route>
       </Routes>
+
       {showSplash && <SplashScreen onFinish={handleSplashFinish} />}
+
+      {dialog === 'disclaimer' && (
+        <DisclaimerDialog onAgree={handleAgree} onExit={handleExit} />
+      )}
+      {dialog === 'donation' && (
+        <DonationDialog onClose={handleDonationClose} onGoDonate={handleGoDonate} />
+      )}
     </>
   );
 }

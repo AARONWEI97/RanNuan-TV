@@ -24,9 +24,18 @@ export function itemSiteName(item: MediaItem | { site_key: string; site_name?: s
   return SITE_NAMES[item.site_key] || item.site_name || item.site_key;
 }
 
-/** 生成播放页链接（直接跳转播放器，支持断点续播） */
-export function playerLink(item: MediaItem | { site_key: string; vod_id: string }): string {
-  return `/player/${item.site_key}/${item.vod_id}`;
+/** 生成播放页链接（直接跳转播放器，支持断点续播 + 指定集数） */
+export function playerLink(
+  item: MediaItem | { site_key: string; vod_id: string },
+  sourceIndex?: number,
+  episodeIndex?: number,
+): string {
+  const base = `/player/${item.site_key}/${item.vod_id}`;
+  const params = new URLSearchParams();
+  if (sourceIndex !== undefined && sourceIndex > 0) params.set('src', String(sourceIndex));
+  if (episodeIndex !== undefined && episodeIndex > 0) params.set('ep', String(episodeIndex));
+  const qs = params.toString();
+  return qs ? `${base}?${qs}` : base;
 }
 
 /** 生成详情页链接：多源走 /detail/source/:name?keys=...，单源走 /detail/:siteKey/:id */

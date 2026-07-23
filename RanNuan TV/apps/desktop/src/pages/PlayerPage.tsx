@@ -8,8 +8,6 @@ import { detailLink, siteChineseName } from '../utils/navigate';
 import { proxyImg } from '../utils/imageProxy';
 import { stripHtml } from '../utils/text';
 
-const PROGRESS_KEY = 'ran-nuan-tv-progress';
-
 function normalizeSubType(tn: string): string { return tn.replace(/[片剧]$/, ''); }
 
 function mapTypeToCategory(typeName: string): { category: string; subType: string } | null {
@@ -35,6 +33,88 @@ function NowPlayingBars({ className = '' }: { className?: string }) {
   );
 }
 
+/**
+ * 集数列表（分段 Tab 分页，默认每段 50 条）
+ * - 显示 ep.title：纯数字（如"1"/"第01集"）与文字标题（如"20241001回顾1"）自动适配
+ * - 超过 pageSize 时顶部显示分段 Tab（1-50 / 51-100 / ...），点击切换
+ * - 当前播放集变化时自动选中其所在段（历史续播 / 切集后定位）
+ */
+function EpisodesList({
+  episodes, activeIndex, onSelect, pageSize = 50,
+}: {
+  episodes: { title: string; url: string }[];
+  activeIndex: number;
+  onSelect: (index: number) => void;
+  pageSize?: number;
+}) {
+  const [page, setPage] = useState(0);
+  // 仅依赖 activeIndex 同步翻页（不依赖 episodes 引用，避免 re-render 时引用变化导致误 reset）：
+  //  - 有效集数（>=0）：翻到该集所在页（历史续播 / 切集后自动定位）
+  //  - 无当前集（<0，如查看非播放线路）：回到第 0 页
+  // 用户手动翻页时 activeIndex 不变，本 effect 不触发，浏览位置得以保持
+  useEffect(() => {
+    setPage(activeIndex < 0 ? 0 : Math.floor(activeIndex / pageSize));
+  }, [activeIndex, pageSize]);
+
+  const totalPages = Math.ceil(episodes.length / pageSize);
+  const start = page * pageSize;
+  const end = Math.min(start + pageSize, episodes.length);
+  const visible = episodes.slice(start, end);
+  const showPager = episodes.length > pageSize;
+  // 标题全是"第N集"等短数字格式时用 5 列等宽网格，保证每段布局一致；
+  // 含长文字标题（如综艺"20241001回顾1"）时改用 flex-wrap 自适应避免截断
+  const compact = episodes.length > 0 && episodes.every((ep) => /^第?\d{1,4}集?$/.test(ep.title.trim()));
+
+  return (
+    <div className="space-y-2">
+      {/* 分段 Tab：1-50 / 51-100 / ... */}
+      {showPager && (
+        <div className="flex flex-wrap gap-1">
+          {Array.from({ length: totalPages }).map((_, p) => {
+            const s = p * pageSize;
+            const e = Math.min(s + pageSize, episodes.length);
+            return (
+              <button
+                key={p}
+                onClick={() => setPage(p)}
+                className={`px-2 py-0.5 rounded text-[11px] transition-all border ${
+                  p === page
+                    ? 'bg-brand-500/15 text-brand-400 border-brand-500/20'
+                    : 'bg-white/[0.04] text-zinc-500 hover:bg-white/[0.08] hover:text-zinc-300 border-white/[0.03]'
+                }`}
+              >
+                {s + 1}-{e}
+              </button>
+            );
+          })}
+        </div>
+      )}
+      {/* 集数按钮 */}
+      <div className={`${compact ? 'grid grid-cols-5' : 'flex flex-wrap'} gap-1.5 max-h-72 overflow-y-auto custom-scrollbar p-0.5`}>
+        {visible.map((ep, i) => {
+          const realIdx = start + i;
+          const active = realIdx === activeIndex;
+          return (
+            <button
+              key={realIdx}
+              onClick={() => onSelect(realIdx)}
+              title={ep.title}
+              className={`relative h-8 px-1.5 rounded-lg text-[11px] font-medium transition-all ${
+                active
+                  ? 'bg-brand-500 text-white shadow shadow-brand-500/20'
+                  : 'bg-white/[0.04] text-zinc-400 hover:bg-white/[0.10] hover:text-zinc-200 border border-white/[0.03]'
+              }`}
+            >
+              <span className={`block max-w-[10rem] truncate ${active ? 'opacity-20' : ''}`}>{ep.title}</span>
+              {active && <NowPlayingBars className="absolute right-1.5 top-1/2 -translate-y-1/2" />}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export default function PlayerPage() {
   const { siteKey, id } = useParams<{ siteKey?: string; id?: string }>();
   const [searchParams] = useSearchParams();
@@ -51,10 +131,16 @@ export default function PlayerPage() {
   const [relatedError, setRelatedError] = useState('');
   const relatedAbortRef = useRef<AbortController | null>(null);
 
-  const { addToHistory, updatePlayPosition } = useHistoryStore();
+  const { entries, addToHistory, updatePlayPosition, setEpisodeContext } = useHistoryStore();
   const [multiSources, setMultiSources] = useState<{ siteKey: string; siteName: string; vodId: string; sources: ReturnType<typeof parsePlaySources> }[]>([]);
   const [activeTabSite, setActiveTabSite] = useState<string>(siteKey || '');
-  const [activeTabSource, setActiveTabSource] = useState(0);
+  const [activeTabSource, setActiveTabSource] = useState(srcIdx);
+
+  // 历史续播或切换播放线路后，选集面板应展示当前实际播放的线路。
+  useEffect(() => {
+    setActiveTabSite(siteKey || '');
+    setActiveTabSource(srcIdx);
+  }, [siteKey, srcIdx]);
 
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
@@ -62,10 +148,6 @@ export default function PlayerPage() {
   const [videoError, setVideoError] = useState('');
   const [retryCount, setRetryCount] = useState(0);
   const MAX_RETRIES = 20;
-
-  const lastSaveRef = useRef(0);
-  const timeRef = useRef(0);
-  const durRef = useRef(0);
 
   // ---- 数据加载 ----
   useEffect(() => {
@@ -114,21 +196,10 @@ export default function PlayerPage() {
     return () => controller.abort();
   }, [detail]);
 
-  // ---- 进度 + 历史 ----
-  const getStartTime = (): number => {
-    try { const data = JSON.parse(localStorage.getItem(PROGRESS_KEY) || '{}'); return data[id || ''] || 0; } catch { return 0; }
-  };
-  const saveProgress = useCallback((time: number, duration: number) => {
-    if (!id || time <= 1 || duration === 0) return;
-    if (Date.now() - lastSaveRef.current < 5000) return;
-    lastSaveRef.current = Date.now();
-    try { const data = JSON.parse(localStorage.getItem(PROGRESS_KEY) || '{}'); data[id] = Math.floor(time); localStorage.setItem(PROGRESS_KEY, JSON.stringify(data)); } catch {}
-  }, [id]);
-
   const handleVideoError = (error: string) => { if (!useProxy) { setUseProxy(true); setVideoError(''); return; } setVideoError(error); };
   const handleRetry = () => { if (retryCount >= MAX_RETRIES) return; setRetryCount(c => c + 1); setVideoError(''); setUseProxy(p => !p); };
 
-  const sources = detail ? parsePlaySources(detail.vod_play_from || '', detail.vod_play_url || '', siteKey) : [];
+  const sources = useMemo(() => detail ? parsePlaySources(detail.vod_play_from || '', detail.vod_play_url || '', siteKey) : [], [detail, siteKey]);
   const currentSource = sources[srcIdx];
   const episodes = currentSource?.episodes.map((ep, i) => ({ title: ep.title, url: ep.url, index: i })) || [];
   const currentEp = episodes[epIdx];
@@ -142,18 +213,35 @@ export default function PlayerPage() {
 
   const historyRecordedRef = useRef(false);
   useEffect(() => {
-    if (loaded && playUrl && historyItem && !historyRecordedRef.current) { historyRecordedRef.current = true; addToHistory(historyItem); }
+    if (loaded && playUrl && historyItem && !historyRecordedRef.current) {
+      historyRecordedRef.current = true;
+      addToHistory(historyItem, { sourceIndex: srcIdx, episodeIndex: epIdx, episodeTitle: currentEp?.title });
+    }
     return () => { historyRecordedRef.current = false; };
-  }, [loaded, playUrl, historyItem, addToHistory, srcIdx, epIdx]);
+  }, [loaded, playUrl, historyItem, addToHistory, srcIdx, epIdx, currentEp?.title]);
 
   const handleTimeUpdate = useCallback((time: number, duration: number) => {
-    timeRef.current = time; durRef.current = duration;
-    saveProgress(time, duration);
-    if (historyItem) updatePlayPosition(historyItem, time, duration);
-  }, [saveProgress, historyItem, updatePlayPosition]);
+    if (historyItem) updatePlayPosition(historyItem, time, duration, { sourceIndex: srcIdx, episodeIndex: epIdx, episodeTitle: currentEp?.title });
+  }, [historyItem, updatePlayPosition, srcIdx, epIdx, currentEp?.title]);
+
+  // 切换集数/线路时立即同步历史上下文（不等播放位置的 throttle）
+  useEffect(() => {
+    if (!historyItem) return;
+    setEpisodeContext(historyItem, srcIdx, epIdx, currentEp?.title);
+  }, [historyItem, srcIdx, epIdx, currentEp?.title, setEpisodeContext]);
 
   const actors = detail?.vod_actor ? detail.vod_actor.split(/[,，、\s]+/).filter(Boolean).slice(0, 6) : [];
-  const savedPosition = epIdx === 0 ? getStartTime() : 0;
+  // 从历史记录恢复播放位置：仅当历史 entry 的集数/线路与当前完全一致时才恢复
+  const historyEntry = entries.find(
+    (e) => `${e.item.site_key || ''}_${e.item.vod_id || ''}` === `${siteKey || ''}_${id || ''}`
+  );
+  const savedPosition =
+    historyEntry &&
+    (historyEntry.episodeIndex ?? 0) === epIdx &&
+    (historyEntry.sourceIndex ?? 0) === srcIdx &&
+    historyEntry.playPosition > 0
+      ? historyEntry.playPosition
+      : 0;
   const showEpisodes = episodes.length > 1 || multiSources.length > 0;
 
   if (!loaded) {
@@ -279,7 +367,7 @@ export default function PlayerPage() {
                 <p className="text-zinc-400 text-xs font-medium">选集</p>
                 <div className="flex flex-wrap gap-1">
                   {sources.length > 0 && (
-                    <button onClick={() => { setActiveTabSite(siteKey || ''); setActiveTabSource(0); }}
+                    <button onClick={() => { setActiveTabSite(siteKey || ''); setActiveTabSource(srcIdx); }}
                       className={`px-2.5 py-1 rounded-lg text-xs transition-all ${activeTabSite === (siteKey || '') ? 'bg-brand-500 text-white shadow shadow-brand-500/20' : 'bg-white/[0.04] text-zinc-400 hover:bg-white/[0.08]'}`}>{siteChineseName(siteKey || '')}</button>
                   )}
                   {multiSources.filter(ms => ms.siteKey !== siteKey).map(ms => (
@@ -301,15 +389,11 @@ export default function PlayerPage() {
                           ))}
                         </div>
                       )}
-                      <div className="grid grid-cols-5 gap-1 mt-1">
-                        {s.episodes.map((ep, ei) => (
-                          <button key={ei} onClick={() => { const p = new URLSearchParams(searchParams); p.set('src', String(si)); p.set('ep', String(ei)); navigate(`/player/${siteKey}/${id}?${p}`, { replace: true }); }}
-                            className={`relative h-8 rounded-lg text-[11px] font-medium transition-all ${si === srcIdx && ei === epIdx ? 'bg-brand-500 text-white shadow shadow-brand-500/20' : 'bg-white/[0.04] text-zinc-400 hover:bg-white/[0.10] hover:text-zinc-200 border border-white/[0.03]'}`}>
-                            <span className={si === srcIdx && ei === epIdx ? 'opacity-20' : ''}>{ei + 1}</span>
-                            {si === srcIdx && ei === epIdx && <NowPlayingBars className="absolute inset-0 m-auto" />}
-                          </button>
-                        ))}
-                      </div>
+                      <EpisodesList
+                        episodes={s.episodes}
+                        activeIndex={si === srcIdx ? epIdx : -1}
+                        onSelect={(ei) => { const p = new URLSearchParams(searchParams); p.set('src', String(si)); p.set('ep', String(ei)); navigate(`/player/${siteKey}/${id}?${p}`, { replace: true }); }}
+                      />
                     </>
                   );
                 })()}
@@ -329,12 +413,11 @@ export default function PlayerPage() {
                           ))}
                         </div>
                       )}
-                      <div className="grid grid-cols-5 gap-1 mt-1">
-                        {s.episodes.map((ep, ei) => (
-                          <button key={ei} onClick={() => navigate(`/player/${ms.siteKey}/${ms.vodId}?src=${si}&ep=${ei}&keys=${encodeURIComponent(keysParam)}`, { replace: true })}
-                            className="relative h-8 rounded-lg text-[11px] font-medium transition-all bg-white/[0.04] text-zinc-500 hover:bg-white/[0.10] hover:text-zinc-200 border border-white/[0.03]">{ei + 1}</button>
-                        ))}
-                      </div>
+                      <EpisodesList
+                        episodes={s.episodes}
+                        activeIndex={-1}
+                        onSelect={(ei) => navigate(`/player/${ms.siteKey}/${ms.vodId}?src=${si}&ep=${ei}&keys=${encodeURIComponent(keysParam)}`, { replace: true })}
+                      />
                     </>
                   );
                 })()}

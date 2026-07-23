@@ -93,7 +93,7 @@ export default function HistoryPage() {
             return (
               <div
                 key={`${entry.item.site_key}_${entry.item.vod_id}_${idx}`}
-                onClick={() => navigate(playerLink(entry.item))}
+                onClick={() => navigate(playerLink(entry.item, entry.sourceIndex, entry.episodeIndex))}
                 className="group cursor-pointer rounded-2xl overflow-hidden glass-card transition-transform hover:scale-[1.02]"
               >
                 {/* 海报 */}
@@ -142,6 +142,11 @@ export default function HistoryPage() {
                   <h3 className="text-sm font-medium text-white/90 truncate leading-tight" title={entry.item.vod_name}>
                     {entry.item.vod_name}
                   </h3>
+                  {entry.episodeTitle && (
+                    <p className="text-[11px] text-zinc-400 mt-1 truncate" title={entry.episodeTitle}>
+                      {entry.episodeTitle}
+                    </p>
+                  )}
                   {hasWatched ? (
                     <p className="text-[11px] text-brand-400/70 mt-1 truncate">
                       已看 {formatTime(entry.playPosition)}{entry.duration > 0 ? ` / ${formatTime(entry.duration)}` : ''}

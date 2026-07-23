@@ -105,21 +105,36 @@ export const useFavoriteStore = create<FavoriteState>()(
   ),
 );
 
-// ==================== 观看历史（持久化，最多 100 条，记录播放位置） ====================
+// ==================== 观看历史（持久化，最多 100 条，记录播放位置 + 集数） ====================
 export interface HistoryEntry {
   item: MediaItem;
   watchedAt: string;    // ISO 8601，首次播放时间
   playPosition: number; // 秒，最后播放位置
   duration: number;     // 秒，视频总时长
+  /** 上次播放的源/线路索引（多线路时） */
+  sourceIndex: number;
+  /** 上次播放的集数索引 */
+  episodeIndex: number;
+  /** 上次播放的剧集名（冗余存储，历史页可直接显示，无需重新拉详情） */
+  episodeTitle?: string;
+}
+
+/** 记录播放进度的可选上下文（哪一集的哪个时间点） */
+export interface HistoryProgress {
+  sourceIndex?: number;
+  episodeIndex?: number;
+  episodeTitle?: string;
 }
 
 interface HistoryState {
   entries: HistoryEntry[];
-  addToHistory: (item: MediaItem) => void;
+  addToHistory: (item: MediaItem, ctx?: HistoryProgress) => void;
   removeFromHistory: (item: MediaItem) => void;
   clearHistory: () => void;
-  /** 更新播放位置（播放中周期性调用） */
-  updatePlayPosition: (item: MediaItem, position: number, dur: number) => void;
+  /** 更新播放位置（播放中周期性调用），可同时更新集数上下文 */
+  updatePlayPosition: (item: MediaItem, position: number, dur: number, ctx?: HistoryProgress) => void;
+  /** 切换集数/线路时同步上下文，并清除上一集的播放位置 */
+  setEpisodeContext: (item: MediaItem, sourceIndex: number, episodeIndex: number, episodeTitle?: string) => void;
 }
 
 const MAX_HISTORY = 100;
@@ -128,12 +143,27 @@ export const useHistoryStore = create<HistoryState>()(
   persist(
     (set, get) => ({
       entries: [],
-      addToHistory: (item) =>
+      addToHistory: (item, ctx) =>
         set((s) => {
           const key = favKey(item);
           const filtered = s.entries.filter((e) => favKey(e.item) !== key);
+          const old = s.entries.find((e) => favKey(e.item) === key);
+          const nextSourceIndex = ctx?.sourceIndex ?? old?.sourceIndex ?? 0;
+          const nextEpisodeIndex = ctx?.episodeIndex ?? old?.episodeIndex ?? 0;
+          const contextChanged = !!old && (
+            (old.sourceIndex ?? 0) !== nextSourceIndex ||
+            (old.episodeIndex ?? 0) !== nextEpisodeIndex
+          );
           const newEntries: HistoryEntry[] = [
-            { item, watchedAt: new Date().toISOString(), playPosition: 0, duration: 0 },
+            {
+              item,
+              watchedAt: new Date().toISOString(),
+              playPosition: contextChanged ? 0 : old?.playPosition ?? 0,
+              duration: contextChanged ? 0 : old?.duration ?? 0,
+              sourceIndex: nextSourceIndex,
+              episodeIndex: nextEpisodeIndex,
+              episodeTitle: ctx?.episodeTitle ?? old?.episodeTitle,
+            },
             ...filtered,
           ];
           if (newEntries.length > MAX_HISTORY) newEntries.length = MAX_HISTORY;
@@ -145,15 +175,41 @@ export const useHistoryStore = create<HistoryState>()(
           return { entries: s.entries.filter((e) => favKey(e.item) !== key) };
         }),
       clearHistory: () => set({ entries: [] }),
-      updatePlayPosition: (item, position, dur) =>
+      updatePlayPosition: (item, position, dur, ctx) =>
         set((s) => {
           const key = favKey(item);
           return {
             entries: s.entries.map((e) =>
               favKey(e.item) === key
-                ? { ...e, playPosition: Math.floor(position), duration: Math.floor(dur) }
+                ? {
+                    ...e,
+                    playPosition: Math.floor(position),
+                    duration: Math.floor(dur),
+                    ...(ctx?.sourceIndex !== undefined && { sourceIndex: ctx.sourceIndex }),
+                    ...(ctx?.episodeIndex !== undefined && { episodeIndex: ctx.episodeIndex }),
+                    ...(ctx?.episodeTitle !== undefined && { episodeTitle: ctx.episodeTitle }),
+                  }
                 : e,
             ),
+          };
+        }),
+      setEpisodeContext: (item, sourceIndex, episodeIndex, episodeTitle) =>
+        set((s) => {
+          const key = favKey(item);
+          return {
+            entries: s.entries.map((e) => {
+              if (favKey(e.item) !== key) return e;
+              const contextChanged =
+                (e.sourceIndex ?? 0) !== sourceIndex ||
+                (e.episodeIndex ?? 0) !== episodeIndex;
+              return {
+                ...e,
+                ...(contextChanged && { playPosition: 0, duration: 0 }),
+                sourceIndex,
+                episodeIndex,
+                ...(episodeTitle !== undefined && { episodeTitle }),
+              };
+            }),
           };
         }),
     }),
