@@ -29,6 +29,7 @@ import com.rannuan.tv.ui.screens.detail.putDetailPreview
 import com.rannuan.tv.ui.screens.home.MediaCard
 import com.rannuan.tv.ui.theme.*
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -46,6 +47,32 @@ private data class CategoryRestore(
     val items: List<MediaItem>,
     val lastResponse: CategoryResponse?
 )
+
+private data class CategoryScrollPosition(val index: Int, val offset: Int)
+
+private object CategoryScrollMemory {
+    private const val MAX_ENTRIES = 24
+    private val positions = object : LinkedHashMap<String, CategoryScrollPosition>(MAX_ENTRIES, 0.75f, true) {
+        override fun removeEldestEntry(
+            eldest: MutableMap.MutableEntry<String, CategoryScrollPosition>?
+        ): Boolean = size > MAX_ENTRIES
+    }
+
+    private fun key(category: String, subType: String?) = "$category|${subType.orEmpty()}"
+
+    @Synchronized
+    fun get(category: String, subType: String?): CategoryScrollPosition? = positions[key(category, subType)]
+
+    @Synchronized
+    fun put(category: String, subType: String?, index: Int, offset: Int) {
+        positions[key(category, subType)] = CategoryScrollPosition(index.coerceAtLeast(0), offset.coerceAtLeast(0))
+    }
+
+    @Synchronized
+    fun clear(category: String, subType: String?) {
+        positions.remove(key(category, subType))
+    }
+}
 
 private fun categoryIdentity(item: MediaItem): String {
     val title = item.vodName.ifBlank { item.title }
@@ -192,21 +219,26 @@ fun CategoryScreen(type: String, api: RanNuanApi, onNavigate: (String) -> Unit) 
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
     var page by rememberSaveable { mutableStateOf(1) }
+    var requestedPage by rememberSaveable { mutableStateOf(page) }
     var loadingMore by remember { mutableStateOf(false) }
     var loadMoreError by remember { mutableStateOf<String?>(null) }
     var retryKey by rememberSaveable { mutableIntStateOf(0) }
-    var allItems by remember(currentType) { mutableStateOf<List<MediaItem>>(emptyList()) }
+    var allItems by remember { mutableStateOf<List<MediaItem>>(emptyList()) }
     // 当前选中的子分类标签（null = 全部）
     var activeSub by rememberSaveable { mutableStateOf<String?>(null) }
-    var firstPageComplete by remember(currentType, activeSub) { mutableStateOf(false) }
+    var firstPageComplete by remember { mutableStateOf(false) }
     val subList = SUB_CATEGORIES[currentType] ?: emptyList()
     val gridState = rememberLazyGridState()
     val screenScope = rememberCoroutineScope()
     val latestPage by rememberUpdatedState(page)
+    val scrollKey = "$currentType|${activeSub.orEmpty()}"
+    var restoredScrollKey by remember { mutableStateOf<String?>(null) }
 
-    fun restoreCachedFirstPage(subType: String?) {
-        val cached = CategoryPageCache.restore(currentType, subType, 1)
-        val disk = if (cached.items.isEmpty()) CategoryDiskCache.get(context, currentType, subType) else null
+    fun restoreCachedFirstPage(category: String, subType: String?) {
+        page = 1
+        requestedPage = 1
+        val cached = CategoryPageCache.restore(category, subType, 1)
+        val disk = if (cached.items.isEmpty()) CategoryDiskCache.get(context, category, subType) else null
         data = cached.lastResponse ?: disk
         allItems = dedupeCategoryItems(cached.items.ifEmpty { disk?.list.orEmpty() })
         firstPageComplete = (cached.lastResponse ?: disk)?.complete == true
@@ -227,24 +259,15 @@ fun CategoryScreen(type: String, api: RanNuanApi, onNavigate: (String) -> Unit) 
             (page < totalPages || (currentPageHadItems && allItems.size >= page * CATEGORY_PAGE_SIZE))
     }
 
-    // 分类切换时重置
-    LaunchedEffect(currentType) {
-        activeSub = null
-        page = 1
-        restoreCachedFirstPage(null)
-        gridState.scrollToItem(0)
-        if (currentType != type) {
-            onNavigate("category/$currentType")
-        }
-    }
-
-    // 加载分类数据
-    LaunchedEffect(currentType, page, activeSub, retryKey) {
-        val cached = CategoryPageCache.get(currentType, activeSub, page)
+    // requestedPage 是准备加载的页；page 只记录最后一次成功页，失败时绝不提前推进。
+    LaunchedEffect(currentType, requestedPage, activeSub, retryKey) {
+        val targetPage = requestedPage.coerceAtLeast(1)
+        val cached = CategoryPageCache.get(currentType, activeSub, targetPage)
         if (cached != null) {
-            val restored = CategoryPageCache.restore(currentType, activeSub, page)
+            val restored = CategoryPageCache.restore(currentType, activeSub, targetPage)
             allItems = restored.items.ifEmpty { cached.list }
             data = restored.lastResponse ?: cached
+            page = targetPage
             loading = false
             loadingMore = false
             loadMoreError = null
@@ -253,23 +276,51 @@ fun CategoryScreen(type: String, api: RanNuanApi, onNavigate: (String) -> Unit) 
         }
 
         try {
-            val resp = CategoryPageCache.getOrFetch(api, currentType, activeSub, page)
-            if (page == 1) {
-                data = resp
-                allItems = dedupeCategoryItems(resp.list)
-                firstPageComplete = resp.complete
-                if (resp.complete) CategoryDiskCache.put(context, currentType, activeSub, resp)
-            } else {
-                allItems = dedupeCategoryItems(allItems + resp.list)
+            var lastError: Throwable? = null
+            var resp: CategoryResponse? = null
+            val attempts = if (targetPage == 1) 2 else 3
+            repeat(attempts) { attempt ->
+                if (resp != null) return@repeat
+                try {
+                    resp = CategoryPageCache.getOrFetch(api, currentType, activeSub, targetPage)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Throwable) {
+                    lastError = failure
+                    if (attempt < attempts - 1) delay(450L * (attempt + 1))
+                }
             }
-            data = resp
+            val response = resp ?: throw lastError ?: IllegalStateException("加载分类失败")
+            if (targetPage == 1) {
+                data = response
+                allItems = dedupeCategoryItems(response.list)
+                firstPageComplete = response.complete
+                if (response.complete) CategoryDiskCache.put(context, currentType, activeSub, response)
+            } else {
+                allItems = dedupeCategoryItems(allItems + response.list)
+            }
+            data = response
+            page = targetPage
             loading = false
             loadingMore = false
             loadMoreError = null
+            error = null
         } catch (e: Exception) {
-            if (page == 1) { error = e.message; loading = false }
+            if (targetPage == 1) { error = e.message; loading = false }
             else loadMoreError = e.message ?: "加载下一页失败"
             loadingMore = false
+        }
+    }
+
+    // NavHost 返回时列表内容可能先为空，等缓存页恢复后再应用上次的索引和像素偏移。
+    LaunchedEffect(scrollKey, allItems.size) {
+        if (restoredScrollKey == scrollKey || allItems.isEmpty()) return@LaunchedEffect
+        val saved = CategoryScrollMemory.get(currentType, activeSub)
+        if (saved == null) {
+            restoredScrollKey = scrollKey
+        } else if (saved.index < allItems.size) {
+            gridState.scrollToItem(saved.index, saved.offset)
+            restoredScrollKey = scrollKey
         }
     }
 
@@ -308,7 +359,12 @@ fun CategoryScreen(type: String, api: RanNuanApi, onNavigate: (String) -> Unit) 
             if (refreshed.list.isNotEmpty()) {
                 CategoryPageCache.put(currentType, activeSub, 1, refreshed)
                 val restored = CategoryPageCache.restore(currentType, activeSub, latestPage)
-                if (restored.items.isNotEmpty()) allItems = restored.items
+                val refreshedItems = if (restored.items.size >= allItems.size) {
+                    restored.items
+                } else {
+                    dedupeCategoryItems(refreshed.list + allItems)
+                }
+                if (refreshedItems.isNotEmpty()) allItems = refreshedItems
                 if (latestPage == 1) data = refreshed
                 if (refreshed.complete) CategoryDiskCache.put(context, currentType, activeSub, refreshed)
             }
@@ -329,7 +385,16 @@ fun CategoryScreen(type: String, api: RanNuanApi, onNavigate: (String) -> Unit) 
             items(CATEGORY_NAMES.entries.toList()) { (key, name) ->
                 FilterChip(
                     selected = currentType == key,
-                    onClick = { if (currentType != key) currentType = key },
+                    onClick = {
+                        if (currentType != key) {
+                            CategoryScrollMemory.clear(key, null)
+                            currentType = key
+                            activeSub = null
+                            restoreCachedFirstPage(key, null)
+                            restoredScrollKey = null
+                            screenScope.launch { gridState.scrollToItem(0) }
+                        }
+                    },
                     label = {
                         Text(
                             name,
@@ -362,9 +427,10 @@ fun CategoryScreen(type: String, api: RanNuanApi, onNavigate: (String) -> Unit) 
                         selected = activeSub == null,
                         onClick = {
                             if (activeSub != null) {
+                                CategoryScrollMemory.clear(currentType, null)
                                 activeSub = null
-                                page = 1
-                                restoreCachedFirstPage(null)
+                                restoreCachedFirstPage(currentType, null)
+                                restoredScrollKey = null
                                 screenScope.launch { gridState.scrollToItem(0) }
                             }
                         },
@@ -384,9 +450,10 @@ fun CategoryScreen(type: String, api: RanNuanApi, onNavigate: (String) -> Unit) 
                         selected = activeSub == sub,
                         onClick = {
                             if (activeSub != sub) {
+                                CategoryScrollMemory.clear(currentType, sub)
                                 activeSub = sub
-                                page = 1
-                                restoreCachedFirstPage(sub)
+                                restoreCachedFirstPage(currentType, sub)
+                                restoredScrollKey = null
                                 screenScope.launch { gridState.scrollToItem(0) }
                             }
                         },
@@ -433,7 +500,13 @@ fun CategoryScreen(type: String, api: RanNuanApi, onNavigate: (String) -> Unit) 
                     Spacer(Modifier.height(12.dp))
                     Text(error ?: "加载失败", color = Zinc400, fontSize = 14.sp)
                     Spacer(Modifier.height(12.dp))
-                    TextButton(onClick = { page = 1; loading = true; error = null; retryKey++ }) {
+                    TextButton(onClick = {
+                        page = 1
+                        requestedPage = 1
+                        loading = true
+                        error = null
+                        retryKey++
+                    }) {
                         Text("重试", color = Brand400)
                     }
                 }
@@ -477,7 +550,7 @@ fun CategoryScreen(type: String, api: RanNuanApi, onNavigate: (String) -> Unit) 
             LaunchedEffect(shouldLoadMore, loadingMore, page, allItems.size, data?.totalPages, data?.outOfRange, activeSub) {
                 if (shouldLoadMore && !loadingMore && loadMoreError == null && hasMorePages() && allItems.isNotEmpty()) {
                     loadingMore = true
-                    page++
+                    requestedPage = page + 1
                 }
             }
 
@@ -501,6 +574,12 @@ fun CategoryScreen(type: String, api: RanNuanApi, onNavigate: (String) -> Unit) 
                 ) { idx ->
                     val item = allItems[idx]
                     MediaCard(item = item) {
+                        CategoryScrollMemory.put(
+                            currentType,
+                            activeSub,
+                            gridState.firstVisibleItemIndex,
+                            gridState.firstVisibleItemScrollOffset
+                        )
                         val title = it.title.ifBlank { it.vodName }.trim()
                         val encodedTitle = java.net.URLEncoder.encode(title, "UTF-8")
                         val route = when {

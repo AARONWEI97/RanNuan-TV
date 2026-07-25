@@ -17,6 +17,7 @@
 import { version } from '../../package.json';
 
 export const APP_VERSION = version;
+export const PROJECT_GITHUB_URL = 'https://github.com/AARONWEI97/RanNuan-TV';
 
 const NOTICE_VERSION_KEY = 'rannuan-notice-version';
 

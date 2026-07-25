@@ -163,7 +163,9 @@ import com.rannuan.tv.ui.util.formatSourceName
 import com.rannuan.tv.ui.util.stripHtml
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.roundToInt
 import androidx.annotation.OptIn as AndroidOptIn
@@ -764,7 +766,6 @@ fun PlayerScreen(
             delay(1200)
         }
         try {
-            var resp = api.getMultiDetail(wd = detailTitle, keys = preciseKeys)
             val merged = mutableListOf(d)
             fun appendCandidates(candidates: List<MediaDetail>) {
                 candidates.forEach { candidate ->
@@ -776,15 +777,32 @@ fun PlayerScreen(
                     }
                 }
             }
-            appendCandidates(resp.list)
-            sourceDetails = merged.toList()
 
-            if (resp.complete == false) {
-                delay(1200)
-                resp = api.getMultiDetail(wd = detailTitle, keys = preciseKeys)
+            suspend fun collectRequest(query: String, requestKeys: String) {
+                var resp = runCatching {
+                    api.getMultiDetail(wd = query, keys = requestKeys)
+                }.getOrNull() ?: return
                 appendCandidates(resp.list)
+                sourceDetails = merged.toList()
+                if (resp.complete == false) {
+                    delay(1200)
+                    resp = runCatching {
+                        api.getMultiDetail(wd = query, keys = requestKeys)
+                    }.getOrNull() ?: return
+                    appendCandidates(resp.list)
+                    sourceDetails = merged.toList()
+                }
             }
-            sourceDetails = merged
+
+            supervisorScope {
+                val exactRequest = preciseKeys.takeIf { it.isNotBlank() }?.let { requestKeys ->
+                    async { collectRequest(query = "", requestKeys = requestKeys) }
+                }
+                val namedRequest = async { collectRequest(query = detailTitle, requestKeys = "") }
+                exactRequest?.await()
+                namedRequest.await()
+            }
+            sourceDetails = merged.toList()
         } catch (_: Exception) {
             if (sourceDetails.isEmpty()) sourceDetails = listOf(d)
         }

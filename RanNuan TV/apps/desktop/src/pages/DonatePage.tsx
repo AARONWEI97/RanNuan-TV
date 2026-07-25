@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { Heart, Sparkles, ExternalLink, QrCode as QrIcon } from 'lucide-react';
-import { openExternal, APP_VERSION } from '../utils/version';
+import { Github, Heart, Sparkles, Star, ExternalLink, QrCode as QrIcon } from 'lucide-react';
+import { openExternal, APP_VERSION, PROJECT_GITHUB_URL } from '../utils/version';
 
 /** 二维码卡片配置 */
 const channels = [
@@ -74,6 +74,28 @@ export default function DonatePage() {
           {channels.map(({ key, ...c }) => (
             <QrCard key={key} {...c} />
           ))}
+        </section>
+
+        <section className="mt-5 animate-reveal animate-reveal-delay-2">
+          <button
+            type="button"
+            onClick={() => void openExternal(PROJECT_GITHUB_URL)}
+            className="group w-full flex items-center justify-between gap-4 p-5 rounded-2xl glass-card text-left"
+          >
+            <div className="flex items-center gap-3 min-w-0">
+              <div className="shrink-0 w-10 h-10 rounded-xl bg-zinc-800 border border-white/10 flex items-center justify-center">
+                <Github size={21} className="text-zinc-100" />
+              </div>
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-white">在 GitHub 为项目点亮 Star</p>
+                <p className="text-xs text-zinc-500 mt-0.5 truncate">github.com/AARONWEI97/RanNuan-TV</p>
+              </div>
+            </div>
+            <div className="shrink-0 flex items-center gap-2 text-amber-400">
+              <Star size={18} className="group-hover:fill-amber-400/30 transition-colors" />
+              <ExternalLink size={16} className="text-zinc-500 group-hover:text-zinc-200 transition-colors" />
+            </div>
+          </button>
         </section>
 
         {/* ====== 外部平台入口（可选） ====== */}

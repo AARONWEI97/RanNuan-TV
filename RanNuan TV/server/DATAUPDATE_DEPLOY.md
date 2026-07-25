@@ -52,11 +52,11 @@ dir "c:\Users\AaronWei\Desktop\dongguaTV-main\RanNuan TV\apps\mobile-android\app
 把上一步的 APK 路径填入下面两条命令中的 `{APK路径}`，在**本机 Windows CMD** 中执行：
 
 ```cmd
-certutil -hashfile "c:\Users\AaronWei\Desktop\dongguaTV-main\RanNuan TV\apps\mobile-android\app\release\RanNuanTV-v2.1.4.apk" SHA256
+certutil -hashfile "c:\Users\AaronWei\Desktop\dongguaTV-main\RanNuan TV\apps\mobile-android\app\release\RanNuanTV-v2.1.5.apk" SHA256
 ```
 
 ```cmd
-for %i in ("c:\Users\AaronWei\Desktop\dongguaTV-main\RanNuan TV\apps\mobile-android\app\release\RanNuanTV-v2.1.4.apk") do @echo %~zi
+for %i in ("c:\Users\AaronWei\Desktop\dongguaTV-main\RanNuan TV\apps\mobile-android\app\release\RanNuanTV-v2.1.5.apk") do @echo %~zi
 ```
 
 **示例：**

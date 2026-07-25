@@ -295,18 +295,32 @@ fun DetailScreen(
             val result = supervisorScope {
                 val collected = mutableListOf<MediaDetail>()
                 val fullKeys = realKeys.takeIf { addresses.size > 1 }.orEmpty()
-                val fullRequest = async {
-                    var response = runCatching { api.getMultiDetail(wd = wd, keys = fullKeys) }.getOrNull()
+
+                suspend fun collectRequest(query: String, requestKeys: String) {
+                    var response = runCatching {
+                        api.getMultiDetail(wd = query, keys = requestKeys)
+                    }.getOrNull()
                     collected.addAll(response?.list.orEmpty())
                     publish(collected + listOfNotNull(primary))
 
                     // 首次限时响应可能只是部分线路；服务端仍在聚合，稍后补拉缓存结果。
-                    if (response?.complete == false && (wd.isNotBlank() || fullKeys.isNotBlank())) {
+                    if (response?.complete == false) {
                         delay(1200L)
-                        response = runCatching { api.getMultiDetail(wd = wd, keys = fullKeys) }.getOrNull()
+                        response = runCatching {
+                            api.getMultiDetail(wd = query, keys = requestKeys)
+                        }.getOrNull()
                         collected.addAll(response?.list.orEmpty())
                         publish(collected + listOfNotNull(primary))
                     }
+                }
+
+                // keys 只负责快速精确命中；片名请求负责继续发现其余站点。
+                // 两者必须并行，否则分类卡片里已有的两站会反过来限制最终线路数量。
+                val exactRequest = fullKeys.takeIf { it.isNotBlank() }?.let { requestKeys ->
+                    async { collectRequest(query = "", requestKeys = requestKeys) }
+                }
+                val namedRequest = wd.takeIf { it.isNotBlank() }?.let { query ->
+                    async { collectRequest(query = query, requestKeys = "") }
                 }
                 val primaryRequest = if (!hasPlayableSeed) async {
                     val first = runCatching {
@@ -330,7 +344,8 @@ fun DetailScreen(
                 } else null
 
                 primaryRequest?.await()
-                fullRequest.await()
+                exactRequest?.await()
+                namedRequest?.await()
                 collected
             }
 

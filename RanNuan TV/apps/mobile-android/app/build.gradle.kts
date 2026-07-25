@@ -14,8 +14,8 @@ android {
         applicationId = "com.rannuan.tv"
         minSdk = 24
         targetSdk = 35
-        versionCode = 7
-        versionName = "2.1.4"
+        versionCode = 8
+        versionName = "2.1.5"
 
         // API 基址
         // 模拟器默认：http://10.0.2.2:3000（10.0.2.2 = 宿主机 localhost）

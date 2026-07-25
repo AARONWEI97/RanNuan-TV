@@ -31,6 +31,7 @@ import com.rannuan.tv.data.api.RanNuanApi
 import com.rannuan.tv.ui.screens.category.CategoryScreen
 import com.rannuan.tv.ui.screens.detail.DetailScreen
 import com.rannuan.tv.ui.screens.home.HomeScreen
+import com.rannuan.tv.ui.notice.StartupNoticeOverlay
 import com.rannuan.tv.ui.screens.player.PlayerScreen
 import com.rannuan.tv.ui.screens.profile.ProfileScreen
 import com.rannuan.tv.ui.screens.search.SearchScreen
@@ -61,7 +62,7 @@ sealed class DetailRoute(val route: String) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MainNavHost(api: RanNuanApi) {
+fun MainNavHost(api: RanNuanApi, onStartupNoticesFinished: () -> Unit = {}) {
     val navController = rememberNavController()
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = navBackStackEntry?.destination?.route
@@ -130,8 +131,14 @@ fun MainNavHost(api: RanNuanApi) {
             composable(Screen.Home.route) {
                 HomeScreen(api = api, onNavigate = { navController.navigate(it) })
             }
-            composable(Screen.Profile.route) {
-                ProfileScreen(onNavigate = { navController.navigate(it) })
+            composable(
+                "profile?tab={tab}",
+                arguments = listOf(navArgument("tab") { type = NavType.StringType; defaultValue = "" })
+            ) { backStackEntry ->
+                ProfileScreen(
+                    initialTab = backStackEntry.arguments?.getString("tab").orEmpty(),
+                    onNavigate = { navController.navigate(it) }
+                )
             }
             composable(
                 "search?wd={wd}",
@@ -217,5 +224,14 @@ fun MainNavHost(api: RanNuanApi) {
                 )
             }
         }
+
+        StartupNoticeOverlay(
+            onFinished = onStartupNoticesFinished,
+            onOpenDonation = {
+                navController.navigate("profile?tab=donate") {
+                    launchSingleTop = true
+                }
+            }
+        )
     }
 }

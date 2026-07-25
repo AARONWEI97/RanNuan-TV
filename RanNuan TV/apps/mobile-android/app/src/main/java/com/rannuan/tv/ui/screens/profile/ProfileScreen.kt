@@ -28,6 +28,7 @@ import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.FavoriteBorder
 import androidx.compose.material.icons.outlined.Schedule
+import androidx.compose.material.icons.outlined.VolunteerActivism
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -48,6 +49,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -98,7 +100,7 @@ private object FavoriteCache {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ProfileScreen(onNavigate: (String) -> Unit) {
+fun ProfileScreen(initialTab: String = "", onNavigate: (String) -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val api = remember { RanNuanApi.create() }
@@ -113,6 +115,9 @@ fun ProfileScreen(onNavigate: (String) -> Unit) {
         mutableStateOf(FavoriteCache.get(favoriteKeys) ?: FavoritesStore.getFavoriteSnapshots(context))
     }
     var favLoading by remember { mutableStateOf(false) }
+    var selectedTab by rememberSaveable(initialTab) {
+        mutableIntStateOf(if (initialTab == "donate") 2 else 0)
+    }
 
     // 每次进入刷新（有缓存则跳过 API）
     LaunchedEffect(Unit) {
@@ -183,7 +188,6 @@ fun ProfileScreen(onNavigate: (String) -> Unit) {
         }
 
         // ── Tab 切换 ──
-        var selectedTab by remember { mutableIntStateOf(0) }
         TabRow(
             selectedTabIndex = selectedTab,
             containerColor = Color.Transparent,
@@ -220,6 +224,17 @@ fun ProfileScreen(onNavigate: (String) -> Unit) {
                     }
                 }
             )
+            Tab(
+                selected = selectedTab == 2,
+                onClick = { selectedTab = 2 },
+                text = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Outlined.VolunteerActivism, null, tint = if (selectedTab == 2) Brand400 else Zinc500, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("捐赠", fontSize = 14.sp)
+                    }
+                }
+            )
         }
 
         when (selectedTab) {
@@ -233,6 +248,7 @@ fun ProfileScreen(onNavigate: (String) -> Unit) {
                 history = emptyList()
                 showClearHistoryDialog = false
             })
+            2 -> DonationTab()
         }
     }
 }

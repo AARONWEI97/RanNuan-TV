@@ -34,8 +34,12 @@ class MainActivity : ComponentActivity() {
                 if (showSplash) {
                     SplashScreen(onFinish = { showSplash = false })
                 } else {
-                    MainNavHost(api = api)
-                    AppUpdateOverlay()
+                    var startupNoticesFinished by remember { mutableStateOf(false) }
+                    MainNavHost(
+                        api = api,
+                        onStartupNoticesFinished = { startupNoticesFinished = true }
+                    )
+                    if (startupNoticesFinished) AppUpdateOverlay()
                 }
             }
         }
