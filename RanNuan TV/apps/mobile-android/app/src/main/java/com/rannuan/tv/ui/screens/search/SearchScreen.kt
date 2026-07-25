@@ -38,7 +38,7 @@ import kotlinx.coroutines.*
 import java.net.URLEncoder
 
 private const val SEARCH_CACHE_MAX_ITEMS = 24
-private const val SEARCH_CACHE_MAX_RESULTS_PER_QUERY = 120
+private const val SEARCH_CACHE_MAX_RESULTS_PER_QUERY = 200
 private const val SEARCH_CACHE_TTL_MS = 10 * 60 * 1000L
 
 private object SearchMemoryCache {
@@ -107,11 +107,7 @@ fun SearchScreen(api: RanNuanApi, onNavigate: (String) -> Unit, initialQuery: St
             val cached = SearchMemoryCache.get(normalizedQuery)
             if (cached != null) {
                 results = cached
-                loading = false
-                progressText = "找到 ${cached.size} 个结果"
-                SearchHistoryStore.addHistory(context, normalizedQuery)
-                history = SearchHistoryStore.getHistory(context)
-                return@LaunchedEffect
+                progressText = "已显示 ${cached.size} 个结果，正在更新..."
             }
 
             searchJob = scope.launch {
@@ -128,7 +124,10 @@ fun SearchScreen(api: RanNuanApi, onNavigate: (String) -> Unit, initialQuery: St
                                 }
                             },
                             onVideos = { partial ->
-                                val rankedPartial = rankSearchResults(normalizedQuery, mergeSearchResults(partial))
+                                val rankedPartial = rankSearchResults(
+                                    normalizedQuery,
+                                    mergeSearchResults(cached.orEmpty() + partial)
+                                )
                                 results = rankedPartial
                                 progressText = "已找到 ${rankedPartial.size} 个结果"
                             }
@@ -139,10 +138,15 @@ fun SearchScreen(api: RanNuanApi, onNavigate: (String) -> Unit, initialQuery: St
                         val data = api.search(normalizedQuery)
                         data.list
                     }
-                    val ranked = rankSearchResults(normalizedQuery, mergeSearchResults(streamResults))
-                    SearchMemoryCache.put(normalizedQuery, ranked)
-                    results = ranked
-                    progressText = "找到 ${ranked.size} 个结果"
+                    val ranked = rankSearchResults(
+                        normalizedQuery,
+                        mergeSearchResults(cached.orEmpty() + streamResults)
+                    )
+                    if (ranked.isNotEmpty()) {
+                        SearchMemoryCache.put(normalizedQuery, ranked)
+                        results = ranked
+                    }
+                    progressText = "找到 ${results.size} 个结果"
                     // 记录搜索历史
                     SearchHistoryStore.addHistory(context, normalizedQuery)
                     history = SearchHistoryStore.getHistory(context)
@@ -399,7 +403,7 @@ fun SearchScreen(api: RanNuanApi, onNavigate: (String) -> Unit, initialQuery: St
                         "detail/source/${URLEncoder.encode(item.vodName, "UTF-8")}?keys=$k"
                     } else if (item.siteKey.isNotBlank() && item.vodId.isNotBlank()) {
                         putDetailPreview(item, item.vodName, "${item.siteKey}:${item.vodId}")
-                        "detail/${item.siteKey}/${item.vodId}"
+                        "detail/${item.siteKey}/${item.vodId}?name=${URLEncoder.encode(item.vodName, "UTF-8")}"
                     } else {
                         putDetailPreview(item, item.vodName, "")
                         "detail/source/${URLEncoder.encode(item.vodName, "UTF-8")}?keys="
@@ -544,14 +548,10 @@ private fun List<MediaItem>.collectSites(): List<SiteInfo> {
 }
 
 private fun searchMergeKey(title: String): String {
-    val raw = title
+    return title
         .lowercase()
-        .replace(Regex("[·・\\s\\-\\[\\]【】]"), "")
-    val normalized = raw
-        .replace(Regex("[（(].*?[）)]"), "")
-        .replace(Regex("\\d{4}"), "")
-        .replace(Regex("第[一二三四五六七八九十\\d]+季"), "")
-    return (normalized.take(15).ifBlank { raw.take(15) }).ifBlank { title }
+        .replace(Regex("[·・:：\\s\\-—_…!！?？,，.。/\\\\\\[\\]【】（）()\"'“”‘’]"), "")
+        .ifBlank { title }
 }
 
 private fun hasUsablePoster(item: MediaItem): Boolean =

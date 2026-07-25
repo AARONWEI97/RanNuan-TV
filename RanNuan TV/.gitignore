@@ -6,3 +6,12 @@ target/
 Thumbs.db
 db.json
 category_cache.json
+
+# Android signing credentials
+*.keystore
+*.jks
+*.p12
+*.pfx
+
+# Bundled at desktop build time from the local Node.js installation
+server/node-runtime/

@@ -7,7 +7,7 @@ const path = require('path');
 const { indexItems, searchByActor, isLikelyActor, hasIndexFor, getStats, saveToDisk, loadFromDisk } = require('./actorIndex');
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const DATA_FILE = path.join(__dirname, 'db.json');
 const ADMIN_PASSWORD = "admin"; 
 const FORCE_UPDATE = true; 
@@ -16,7 +16,18 @@ const CATEGORY_CACHE_FILE = path.join(__dirname, 'category_cache.json');
 
 app.use(cors());
 app.use(bodyParser.json());
-app.use(express.static('public'));
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const APP_UPDATE_DIR = path.join(PUBLIC_DIR, 'dataupdate');
+app.use('/dataupdate', express.static(APP_UPDATE_DIR, {
+    setHeaders: (res, filePath) => {
+        if (path.basename(filePath) === 'latest.json') {
+            res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+        } else if (filePath.toLowerCase().endsWith('.apk')) {
+            res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+        }
+    },
+}));
+app.use(express.static(PUBLIC_DIR));
 
 // ==================== 站点 API 配置 ====================
 // api: CMS API 地址
@@ -36,7 +47,12 @@ if (!fs.existsSync(DATA_FILE) || FORCE_UPDATE) {
     // 只有在没有文件时，或者强制更新开启时，才重置配置
     // 但为了不覆盖你可能手动添加的，我们这里只在文件不存在时写入，或者你确认要重置
     if(!fs.existsSync(DATA_FILE)) {
-        fs.writeFileSync(DATA_FILE, JSON.stringify({ sites: DEFAULT_SITES }, null, 2));
+        try {
+            fs.writeFileSync(DATA_FILE, JSON.stringify({ sites: DEFAULT_SITES }, null, 2));
+        } catch (error) {
+            // 桌面安装包内的 resource 目录可能只读；getDB 会直接使用 DEFAULT_SITES。
+            console.warn(`[Config] db.json 不可写，使用内置站点配置: ${error.message}`);
+        }
     }
 }
 
@@ -94,19 +110,23 @@ const CACHE_TTL = {
     hot: 3 * 60 * 1000,
     category: 10 * 60 * 1000,
     search: 5 * 60 * 1000,
-}; // 分类/搜索缓存：减少重复等待
+    detail: 30 * 60 * 1000,
+    multiDetail: 10 * 60 * 1000,
+}; // 聚合与详情缓存：减少重复等待
 const SEARCH_RESULT_LIMIT = 200;
 const SEARCH_DETAIL_ENRICH_LIMIT_PER_SITE = 24;
 const ACTOR_SCAN_PAGES = 2;
 const ACTOR_SCAN_TYPE_IDS_PER_CATEGORY = 2;
 const ACTOR_SCAN_DETAIL_LIMIT_PER_PAGE = 18;
-const CATEGORY_CACHE_VERSION = 'v2';
+const CATEGORY_CACHE_VERSION = 'v5';
 const CATEGORY_DISK_CACHE_TTL = 24 * 60 * 60 * 1000;
 const CATEGORY_PREWARM_CATEGORIES = ['movie', 'tv', 'variety', 'anime', 'shortDrama', 'sports'];
 const CATEGORY_PREWARM_PAGE_SIZES = [30, 20];
-const CATEGORY_FAST_FIRST_PAGE_TIMEOUT = 3200;
+const CATEGORY_FAST_FIRST_PAGE_TIMEOUT = 4200;
 let categoryCacheSaveTimer = null;
 const categoryFullRefreshInFlight = new Map();
+const detailRequestInFlight = new Map();
+const multiDetailRequestInFlight = new Map();
 
 // ---- 已知站点的分类 type_id 映射（父级 + 子级） ----
 // ⚠️ CMS item 挂在子分类下（动作片=6），不是父级（电影片=1），
@@ -137,17 +157,18 @@ const SITE_TYPE_IDS = {
     // 索尼动漫：32→44港台 33→45海外
     anime:      [4, 29,30,31,44,45],
     // 索尼短剧有子类：54爽文 64女频 65反转 66古装 67年代 68脑洞 69都市 73擦边
-    shortDrama: [46, 54,64,65,66,67,68,69,73],
+    shortDrama: [54,64,65,66,67,68,69,73],
     // 索尼体育编号不标准：48=体育 49篮球 50足球 52斯诺克
     sports:     [48, 49,50,52],
   },
   bdzy: {
-    movie:      [1, 6,7,8,9,10,11,12,20,34,45,49],
-    tv:         [2, 13,14,15,16,21,22,23,24],
+    // 百度当前分类体系与索尼一致，不是标准 MACCMS 编号。
+    movie:      [1, 6,7,8,9,10,11,12,20,39],
+    tv:         [2, 13,14,15,16,17,18,19,23],
     variety:    [3, 25,26,27,28],
-    anime:      [4, 29,30,31,32,33],
-    shortDrama: [46],
-    sports:     [],
+    anime:      [4, 29,30,31,44,45],
+    shortDrama: [54,64,65,66,67,68,69],
+    sports:     [48,49,50,52],
   },
   bfzy: {
     movie:      [20, 21,22,23,24,25,26,27,28,29,50],
@@ -165,8 +186,8 @@ const SITE_TYPE_IDS = {
 const SITE_ROOT_TYPE_IDS = {
   lzzy:  { movie: 1,  tv: 2,  variety: 3,  anime: 4,  shortDrama: 46, sports: 36 },
   ffzy:  { movie: 1,  tv: 2,  variety: 3,  anime: 4,  shortDrama: 36 },
-  suoni: { movie: 1,  tv: 2,  variety: 3,  anime: 4,  shortDrama: 46, sports: 48 },
-  bdzy:  { movie: 1,  tv: 2,  variety: 3,  anime: 4,  shortDrama: 46 },
+  suoni: { movie: 1,  tv: 2,  variety: 3,  anime: 4,  sports: 48 },
+  bdzy:  { movie: 1,  tv: 2,  variety: 3,  anime: 4,  sports: 48 },
   bfzy:  { movie: 20, tv: 30, variety: 45, anime: 39, shortDrama: 58, sports: 53 },
 };
 // 分类名到站点 type_name 的映射（用于动态发现其他站点）
@@ -181,7 +202,7 @@ const CATEGORY_TYPE_NAMES = {
 
 // ===== 子分类 → 各站点 type_id 映射（服务端精准过滤，替代前端 typeMatch） =====
 // 对照 COLLECTION_RULES.md 的标准 MACCMS 编号：
-//   标准站(lzzy/ffzy/suoni/bdzy) — 电影：6动作 7喜剧 8爱情 9科幻 10恐怖 11剧情 12战争 20记录
+//   标准站(lzzy/ffzy) — 电影：6动作 7喜剧 8爱情 9科幻 10恐怖 11剧情 12战争 20记录
 //   标准站 — 电视剧：13国产 14香港 15韩国 16欧美 21台湾 22日本 23海外 24泰国
 //   标准站 — 动漫：29国产 30日韩 31欧美 32港台 33海外
 //   标准站 — 综艺：25大陆 26港台 27日韩 28欧美
@@ -199,47 +220,47 @@ const SUB_TYPE_MAP = {
     '剧情': { lzzy: 11, ffzy: 11, suoni: 11, bdzy: 11, bfzy: 26 },
     '战争': { lzzy: 12, ffzy: 12, suoni: 12, bdzy: 12, bfzy: 27 },
     // 「动画」标准站无独立 movie 动画 type_id（20=纪录片），仅 bfzy 有 50=动画片
-    '动画': { bfzy: 50 },
+    '动画': { lzzy: 49, suoni: 39, bdzy: 39, bfzy: 50 },
   },
   tv: {
-    // 索尼编号不标准：13=国产 14=欧美 15=韩 16=日 17=港 18=台 19=泰
+    // 索尼/百度编号不标准：13=国产 14=欧美 15=韩 16=日 17=港 18=台 19=泰
     '国产': { lzzy: 13, ffzy: 13, suoni: 13, bdzy: 13, bfzy: 31 },
-    '港剧': { lzzy: 14, ffzy: 14, suoni: 17, bdzy: 14, bfzy: 33 },
-    '台剧': { lzzy: 21, ffzy: 21, suoni: 18, bdzy: 21, bfzy: 35 },
-    '日剧': { lzzy: 22, ffzy: 22, suoni: 16, bdzy: 22, bfzy: 36 },
+    '港剧': { lzzy: 14, ffzy: 14, suoni: 17, bdzy: 17, bfzy: 33 },
+    '台剧': { lzzy: 21, ffzy: 21, suoni: 18, bdzy: 18, bfzy: 35 },
+    '日剧': { lzzy: 22, ffzy: 22, suoni: 16, bdzy: 16, bfzy: 36 },
     '韩剧': { lzzy: 15, ffzy: 15, suoni: 15, bdzy: 15, bfzy: 34 },
-    '美剧': { lzzy: 16, ffzy: 16, suoni: 14, bdzy: 16, bfzy: 32 },
-    '泰剧': { lzzy: 24, ffzy: 24, suoni: 19, bdzy: 24, bfzy: 38 },
+    '美剧': { lzzy: 16, ffzy: 16, suoni: 14, bdzy: 14, bfzy: 32 },
+    '泰剧': { lzzy: 24, ffzy: 24, suoni: 19, bdzy: 19, bfzy: 38 },
   },
   anime: {
-    // 索尼动漫：44=港台(标准32) 45=海外(标准33)，无独立剧场版 type_id
+    // 索尼/百度动漫：44=港台(标准32) 45=海外(标准33)，39=动画电影
     '日漫':   { lzzy: 30, ffzy: 30, suoni: 30, bdzy: 30, bfzy: 41 },
     '国漫':   { lzzy: 29, ffzy: 29, suoni: 29, bdzy: 29, bfzy: 40 },
     '欧美':   { lzzy: 31, ffzy: 31, suoni: 31, bdzy: 31, bfzy: 42 },
-    '剧场版': { lzzy: 29, ffzy: 29, bdzy: 29, bfzy: 39 },
+    '剧场版': { lzzy: 49, suoni: 39, bdzy: 39, bfzy: 50 },
   },
   variety: {
-    // 索尼综艺编号不标准：26=日韩 27=港台（标准站 26=港台 27=日韩，互换！）
+    // 索尼/百度综艺：26=日韩 27=港台（标准站 26=港台 27=日韩，互换）
     '大陆综艺': { lzzy: 25, ffzy: 25, suoni: 25, bdzy: 25, bfzy: 46 },
-    '港台综艺': { lzzy: 26, ffzy: 26, suoni: 27, bdzy: 26, bfzy: 47 },
-    '日韩综艺': { lzzy: 27, ffzy: 27, suoni: 26, bdzy: 27, bfzy: 48 },
+    '港台综艺': { lzzy: 26, ffzy: 26, suoni: 27, bdzy: 27, bfzy: 47 },
+    '日韩综艺': { lzzy: 27, ffzy: 27, suoni: 26, bdzy: 26, bfzy: 48 },
     '欧美综艺': { lzzy: 28, ffzy: 28, suoni: 28, bdzy: 28, bfzy: 49 },
   },
   // 体育：量子/索尼/暴风均有子类，标准站 lzzy=37-40, 索尼=49-52, bfzy=54-57
   sports: {
-    '足球':   { lzzy: 37, bfzy: 54, suoni: 50 },
-    '篮球':   { lzzy: 38, bfzy: 55, suoni: 49 },
+    '足球':   { lzzy: 37, bfzy: 54, suoni: 50, bdzy: 50 },
+    '篮球':   { lzzy: 38, bfzy: 55, suoni: 49, bdzy: 49 },
     '网球':   { lzzy: 39, bfzy: 56 },
-    '斯诺克': { lzzy: 40, bfzy: 57, suoni: 52 },
+    '斯诺克': { lzzy: 40, bfzy: 57, suoni: 52, bdzy: 52 },
   },
   // 短剧：仅暴风和索尼有子类
   shortDrama: {
-    '现代言情': { bfzy: 67, suoni: 69 },
-    '古装仙侠': { bfzy: 72, suoni: 66 },
-    '穿越年代': { bfzy: 66, suoni: 67 },
-    '反转爽文': { bfzy: 68, suoni: 65 },
-    '女频总裁': { bfzy: 69, suoni: 64 },
-    '都市脑洞': { bfzy: 71, suoni: 68 },
+    '现代言情': { bfzy: 67, suoni: 69, bdzy: 69 },
+    '古装仙侠': { bfzy: 72, suoni: 66, bdzy: 66 },
+    '穿越年代': { bfzy: 66, suoni: 67, bdzy: 67 },
+    '反转爽文': { bfzy: 68, suoni: 65, bdzy: 65 },
+    '女频总裁': { bfzy: 69, suoni: 64, bdzy: 64 },
+    '都市脑洞': { bfzy: 71, suoni: 68, bdzy: 68 },
   },
 };
 
@@ -267,7 +288,7 @@ async function batchLimit(tasks, limit = 5) {
 function getPriorityScanTypeIds(siteKey, category) {
     const PRIORITY = {
     movie:  { lzzy: [6,7,8,10,11,9,12], ffzy: [6,7,8,10,11,9,12], suoni: [6,7,8,10,11,9,12], bdzy: [6,7,8,10,11,9,12], bfzy: [21,22,25,26,23,24,27] },
-    tv:     { lzzy: [13,15,16,14,21,22], ffzy: [13,15,16,14,21,22], suoni: [13,15,16,14,21,22], bdzy: [13,15,16,14,21,22], bfzy: [31,34,32,33,35,36] },
+    tv:     { lzzy: [13,15,16,14,21,22], ffzy: [13,15,16,14,21,22], suoni: [13,15,14,17,18,16], bdzy: [13,15,14,17,18,16], bfzy: [31,34,32,33,35,36] },
     variety:{ lzzy: [25,26,27,28], ffzy: [25,26,27,28], suoni: [25,26,27,28], bdzy: [25,26,27,28], bfzy: [46,47,48,49] },
     anime:  { lzzy: [29,30,31,32,33], ffzy: [29,30,31,32,33], suoni: [29,30,31,44,45], bdzy: [29,30,31,32,33], bfzy: [40,41,42,43,44] },
     sports: { lzzy: [37,38,39,40], ffzy: [], suoni: [49,50,52], bdzy: [], bfzy: [54,55,56,57] },
@@ -329,7 +350,7 @@ function markCacheComplete(key) {
     if (entry) entry.complete = true;
 }
 function cleanCache() {
-    if (serverCache.size > 100) {
+    if (serverCache.size > 300) {
         const oldest = [...serverCache.entries()].sort((a, b) => a[1].time - b[1].time)[0];
         if (oldest) serverCache.delete(oldest[0]);
     }
@@ -376,11 +397,84 @@ function getWorkingSites() {
 function getFastCategoryTypeIds(siteKey, category) {
     const rootId = SITE_ROOT_TYPE_IDS[siteKey]?.[category];
     const priorityIds = getPriorityScanTypeIds(siteKey, category).slice(0, 2);
-    return [...new Set([rootId, ...priorityIds].filter(Boolean))];
+    if (priorityIds.length > 0) return priorityIds;
+    const configured = SITE_TYPE_IDS[siteKey]?.[category] || [];
+    const childIds = configured.filter(id => id !== rootId).slice(0, 2);
+    return childIds.length > 0 ? childIds : (rootId ? [rootId] : []);
 }
 
 function normalizeSearchKeyword(wd) {
     return String(wd || '').trim().replace(/\s+/g, ' ');
+}
+
+function isActorSearchQuery(value) {
+    const keyword = normalizeSearchKeyword(value);
+    if (!isLikelyActor(keyword)) return false;
+    const indexed = searchByActor(keyword).all.length > 0;
+    if (indexed) return true;
+    if (/^[\u4e00-\u9fa5]+$/.test(keyword)) return [...keyword].length <= 3;
+    return keyword.includes(' ');
+}
+
+function chineseNumberToInt(value) {
+    if (/^\d+$/.test(value)) return Number(value);
+    const digits = { '零': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9 };
+    if (value === '十') return 10;
+    const tenIndex = value.indexOf('十');
+    if (tenIndex >= 0) {
+        const tens = tenIndex === 0 ? 1 : (digits[value[tenIndex - 1]] || 0);
+        const ones = tenIndex === value.length - 1 ? 0 : (digits[value[tenIndex + 1]] || 0);
+        return tens * 10 + ones;
+    }
+    return value.length === 1 ? digits[value] : null;
+}
+
+function normalizeSeasonMarkers(value) {
+    return String(value || '').replace(/第([零一二两三四五六七八九十\d]+)季/g, (match, number) => {
+        const parsed = chineseNumberToInt(number);
+        return Number.isFinite(parsed) ? `第${parsed}季` : match;
+    });
+}
+
+// 片名身份必须保留年份和季数，否则「第一季/第五季」「歌手2024/2025」会被错误合并。
+function normalizeTitleIdentity(value) {
+    return normalizeSeasonMarkers(String(value || '').normalize('NFKC').toLowerCase())
+        .replace(/[\s·・:：\-—_…!！?？,，.。/\\\[\]【】()（）"'“”‘’]/g, '');
+}
+
+function buildTitleSearchVariants(value) {
+    const original = normalizeSearchKeyword(value);
+    if (!original) return [];
+    const normalizedSeason = normalizeSeasonMarkers(original);
+    const compact = normalizedSeason.replace(/[\s·・:：\-—_…!！?？,，.。/\\\[\]【】()（）"'“”‘’]/g, '');
+    const withoutSeason = normalizedSeason.replace(/\s*第[零一二两三四五六七八九十\d]+季\s*$/g, '').trim();
+    return [...new Set([original, compact, withoutSeason].filter(item => item.length >= 2))].slice(0, 3);
+}
+
+function toMediaCardItem(item) {
+    if (!item) return item;
+    const fields = [
+        'vod_id', 'vod_name', 'vod_pic', 'vod_remarks', 'type_id', 'type_id_1', 'type_name',
+        'vod_year', 'vod_area', 'vod_lang', 'vod_actor', 'vod_director', 'vod_douban_id',
+        'site_key', 'site_name', 'latency', 'sites', 'group_key',
+        'id', 'title', 'cover', 'rate', 'rating', 'year', 'type',
+    ];
+    const card = {};
+    for (const field of fields) {
+        if (item[field] !== undefined && item[field] !== null) card[field] = item[field];
+    }
+    return card;
+}
+
+function interleaveSiteItems(siteItems, siteOrder) {
+    const buckets = siteOrder.map(key => siteItems.get(key) || []).filter(list => list.length > 0);
+    const output = [];
+    for (let index = 0; buckets.some(list => index < list.length); index++) {
+        for (const list of buckets) {
+            if (index < list.length) output.push(list[index]);
+        }
+    }
+    return output;
 }
 
 function itemKey(item) {
@@ -518,15 +612,11 @@ function boostActorMatches(items, keyword) {
 function crossSiteImagePicks(items, limit) {
     const groups = new Map();
     items.forEach(item => {
-        // 激进归一化：去特殊字符+括号内容+年份季数+保留核心片名
-        const raw = (item.vod_name || '').replace(/[·・\s\-\[\]【】]/g, '').toLowerCase();
-        const key = raw
-            .replace(/[\（\(].*?[\）\)]/g, '')        // 去括号内容（年份、备注等）
-            .replace(/\d{4}/g, '')                    // 去4位年份
-            .replace(/第[一二三四五六七八九十\d]+季/g, '');  // 去第X季
-        const trimmed = key.substring(0, 15) || raw.substring(0, 15);
-        if (!groups.has(trimmed)) groups.set(trimmed, []);
-        groups.get(trimmed).push(item);
+        const title = item.vod_name || item.title || '';
+        const identity = normalizeTitleIdentity(title);
+        if (!identity) return;
+        if (!groups.has(identity)) groups.set(identity, []);
+        groups.get(identity).push(item);
     });
     
     const picked = [];
@@ -839,7 +929,7 @@ app.get('/api/search', async (req, res) => {
     if (cached) return res.json(cached);
 
     const sites = getWorkingSites();
-    const actorLike = isLikelyActor(wd);
+    const actorLike = isActorSearchQuery(wd);
     let allItems = [];
 
     // 演员搜索优先查本地索引，命中后可以立即减少后续扫描压力。
@@ -855,7 +945,9 @@ app.get('/api/search', async (req, res) => {
     const seenIds = new Set();
     for (const item of allItems) seenIds.add(itemKey(item));
 
-    const searchKw = actorLike ? [wd, `${wd} 电影`, `${wd} 电视剧`] : [wd];
+    const searchKw = actorLike
+        ? [wd, `${wd} 电影`, `${wd} 电视剧`]
+        : buildTitleSearchVariants(wd);
     const titleSearchItems = [];
     const promises = [];
     for (const site of sites) {
@@ -902,7 +994,7 @@ app.get('/api/search', async (req, res) => {
 
     if (allItems.length > 0) {
         allItems = boostActorMatches(allItems, wd);
-        allItems = crossSiteImagePicks(allItems, SEARCH_RESULT_LIMIT);
+        allItems = crossSiteImagePicks(allItems, SEARCH_RESULT_LIMIT).map(toMediaCardItem);
     }
     const result = { list: allItems };
     setCache(cacheKey, result, CACHE_TTL.search);
@@ -915,7 +1007,7 @@ async function searchSitePages(site, kw, maxPages, res) {
     let siteVideos = [];
     const seenIds = new Set();
     try {
-        const r1 = await axios.get(`${site.api}?ac=videolist&wd=${encodeURIComponent(kw)}&pg=1&out=json`, { timeout: 6000 });
+        const r1 = await axios.get(`${site.api}?ac=videolist&wd=${encodeURIComponent(kw)}&pg=1&out=json`, { timeout: 4500 });
         const list1 = r1.data.list || r1.data.data || [];
         if (!Array.isArray(list1)) return [];
         const latency = Date.now() - startTime;
@@ -927,9 +1019,9 @@ async function searchSitePages(site, kw, maxPages, res) {
         }
         const pagecount = Math.min(Number(r1.data.pagecount) || 1, maxPages);
         for (let pg = 2; pg <= pagecount; pg++) {
-            if (res && res.writableEnded) break;
+            if (res && (res.writableEnded || res.destroyed)) break;
             try {
-                const rn = await axios.get(`${site.api}?ac=videolist&wd=${encodeURIComponent(kw)}&pg=${pg}&out=json`, { timeout: 5000 });
+                const rn = await axios.get(`${site.api}?ac=videolist&wd=${encodeURIComponent(kw)}&pg=${pg}&out=json`, { timeout: 3500 });
                 const ln = rn.data.list || rn.data.data || [];
                 if (!Array.isArray(ln) || ln.length === 0) break;
                 for (const item of ln) {
@@ -950,7 +1042,7 @@ app.post('/api/search-stream', async (req, res) => {
     if (!wd) return res.status(400).json({ error: 'Missing wd' });
 
     const sites = getWorkingSites();
-    const actorLike = isLikelyActor(wd);
+    const actorLike = isActorSearchQuery(wd);
     const indexStats = getStats();
     console.log(`[SSE-Search] "${wd}" actorLike=${actorLike} (${sites.length} sources, index=${indexStats.indexedVideoIds}条)`);
 
@@ -958,8 +1050,8 @@ app.post('/api/search-stream', async (req, res) => {
         'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
         'Connection': 'keep-alive', 'X-Accel-Buffering': 'no',
     });
-    const send = (data) => { if (res.writableEnded) return; res.write(`data: ${JSON.stringify(data)}\n\n`); };
-    req.on('close', () => { res.writableEnded = true; });
+    const clientGone = () => res.writableEnded || res.destroyed;
+    const send = (data) => { if (clientGone()) return; res.write(`data: ${JSON.stringify(data)}\n\n`); };
     send({ type: 'start', totalSources: sites.length, actorLike, indexCoverage: indexStats.indexedVideoIds, uniqueActors: indexStats.uniqueActors });
 
     // ---- 1. 演员索引查询（毫秒级） ----
@@ -976,20 +1068,25 @@ app.post('/api/search-stream', async (req, res) => {
     // ---- 2. CMS 关键字搜索 ----
     // #3 修复：索引命中充足的，只搜单个关键字，避免请求爆炸
     const globalResults = [];
-    const searchKeywords = (actorLike && indexHits.length < 20)
-        ? [wd, `${wd} 电影`, `${wd} 电视剧`]
-        : [wd];
+    const searchKeywords = actorLike
+        ? (indexHits.length < 20 ? [wd, `${wd} 电影`, `${wd} 电视剧`] : [wd])
+        : buildTitleSearchVariants(wd);
 
     const searchPromises = [];
     for (const site of sites) {
         for (const kw of searchKeywords) {
             searchPromises.push((async () => {
-                if (res.writableEnded) return;
-                const siteVideos = await searchSitePages(site, kw, 7, res);
+                if (clientGone()) return;
+                const siteVideos = await searchSitePages(site, kw, actorLike ? 3 : 2, res);
                 if (siteVideos.length > 0) {
                     const boosted = boostActorMatches(siteVideos, wd);
                     globalResults.push(...boosted);
-                    send({ type: 'videos', videos: boosted.slice(0, 200), source: `${site.key}:${kw}`, sourceName: `${site.name} - ${kw}` });
+                    send({
+                        type: 'videos',
+                        videos: boosted.slice(0, 200).map(toMediaCardItem),
+                        source: `${site.key}:${kw}`,
+                        sourceName: `${site.name} - ${kw}`,
+                    });
                 }
             })());
         }
@@ -1002,7 +1099,7 @@ app.post('/api/search-stream', async (req, res) => {
     // #1 修复：用 merged 后的 vod_actor 命中数判断，而非单看 indexHits.length
     // #2 修复：每站只扫 2 个 type_id，每类 3 页
     let needScan = false;
-    if (actorLike && res.writableEnded === false) {
+    if (actorLike && !clientGone()) {
         const mergedPreview = crossSiteImagePicks([...indexHits, ...globalResults]);
         const actorMatchCount = mergedPreview.filter(item =>
             (item.vod_actor || '').includes(wd) || (item.vod_director || '').includes(wd)
@@ -1019,16 +1116,16 @@ app.post('/api/search-stream', async (req, res) => {
         const MAX_TYPE_IDS_PER_SITE = 3;
 
         for (const site of sites) {
-            if (res.writableEnded) break;
+            if (clientGone()) break;
             for (const cat of scanCategories) {
-                if (res.writableEnded) break;
+                if (clientGone()) break;
                 // 优先使用常见大分类 type_id，避免选到父级 id（1,2）或冷门 id
                 const priorityIds = getPriorityScanTypeIds(site.key, cat);
                 const selectedTids = priorityIds.length > 0 ? priorityIds.slice(0, MAX_TYPE_IDS_PER_SITE) : [];
                 for (const tid of selectedTids) {
-                    if (res.writableEnded) break;
+                    if (clientGone()) break;
                     for (let pg = 1; pg <= SCAN_PAGES; pg++) {
-                        if (res.writableEnded) break;
+                        if (clientGone()) break;
                         try {
                             const r = await axios.get(`${site.api}?ac=videolist&t=${tid}&pg=${pg}&out=json`, { timeout: 5000 });
                             const list = r.data.list || r.data.data || [];
@@ -1066,8 +1163,8 @@ app.post('/api/search-stream', async (req, res) => {
     // ---- 4. 最终合并 ----
     const allResults = [...indexHits, ...globalResults];
 
-    if (allResults.length > 0 && !res.writableEnded) {
-        const merged = crossSiteImagePicks(allResults);
+    if (allResults.length > 0 && !clientGone()) {
+        const merged = crossSiteImagePicks(allResults).map(toMediaCardItem);
         console.log(`[SSE-Search] Merged: ${allResults.length} -> ${merged.length} (索引${indexHits.length}+搜索${globalResults.length})`);
         send({ type: 'merged', videos: merged, stats: { indexHits: indexHits.length, cmsHits: globalResults.length, merged: merged.length } });
     }
@@ -1076,83 +1173,177 @@ app.post('/api/search-stream', async (req, res) => {
     res.end();
 });
 
+function detailCacheKey(siteKey, id) {
+    return `detail:${siteKey}:${id}`;
+}
+
+function readDetailItem(data) {
+    return data?.list?.[0] || data?.data?.[0] || data;
+}
+
+async function fetchSiteDetail(site, id) {
+    const cacheKey = detailCacheKey(site.key, id);
+    const cached = getCached(cacheKey);
+    if (cached) return cached;
+
+    const existing = detailRequestInFlight.get(cacheKey);
+    if (existing) return existing;
+
+    const request = axios.get(
+        `${site.api}?ac=detail&ids=${encodeURIComponent(id)}&out=json`,
+        { timeout: 6000 }
+    ).then(response => {
+        const detail = readDetailItem(response.data);
+        if (!detail?.vod_id) return null;
+        const tagged = { ...detail, site_key: site.key, site_name: site.name };
+        setCache(cacheKey, tagged, CACHE_TTL.detail);
+        return tagged;
+    }).catch(() => null)
+        .finally(() => detailRequestInFlight.delete(cacheKey));
+
+    detailRequestInFlight.set(cacheKey, request);
+    return request;
+}
+
+function normalizeDetailTitle(value) {
+    return normalizeTitleIdentity(value);
+}
+
+async function fetchNamedDetailFromSite(site, wd) {
+    try {
+        const variants = buildTitleSearchVariants(wd);
+        const responses = await Promise.allSettled(variants.map(keyword => axios.get(
+            `${site.api}?ac=videolist&wd=${encodeURIComponent(keyword)}&pg=1&out=json`,
+            { timeout: 6000 }
+        )));
+        const list = responses.flatMap(result => {
+            if (result.status !== 'fulfilled') return [];
+            const items = result.value.data.list || result.value.data.data || [];
+            return Array.isArray(items) ? items : [];
+        });
+        const query = normalizeDetailTitle(wd);
+        const candidates = list
+            .filter((item, index, all) => item?.vod_id && all.findIndex(other => String(other?.vod_id) === String(item.vod_id)) === index)
+            .map(item => {
+                const name = normalizeDetailTitle(item.vod_name);
+                const score = name === query ? 3 : (name.includes(query) || query.includes(name) ? 1 : 0);
+                return { item, score };
+            })
+            .filter(candidate => candidate.score > 0)
+            .sort((a, b) => b.score - a.score || Number(Boolean(b.item.vod_play_url)) - Number(Boolean(a.item.vod_play_url)));
+        const match = candidates[0]?.item;
+        if (!match?.vod_id) return null;
+
+        // 大多数 MACCMS 的 videolist 已返回完整播放字段。直接复用可省掉一次
+        // 串行 detail 请求，把首条线路从 4~8 秒压缩到一次站点搜索耗时。
+        if (match.vod_play_url) {
+            const tagged = { ...match, site_key: site.key, site_name: site.name };
+            setCache(detailCacheKey(site.key, match.vod_id), tagged, CACHE_TTL.detail);
+            return tagged;
+        }
+        return fetchSiteDetail(site, match.vod_id);
+    } catch {
+        return null;
+    }
+}
+
+function startNamedDetailAggregation(wd, sites) {
+    const normalized = normalizeTitleIdentity(wd);
+    const cacheKey = `multi-detail:name:${normalized}`;
+    const cached = getCached(cacheKey);
+    if (cached) {
+        return {
+            first: Promise.resolve(cached[0] || null),
+            full: Promise.resolve(cached),
+            snapshot: () => cached,
+        };
+    }
+
+    const existing = multiDetailRequestInFlight.get(cacheKey);
+    if (existing) return existing;
+
+    let firstResolved = false;
+    let resolveFirst;
+    const completed = [];
+    const first = new Promise(resolve => { resolveFirst = resolve; });
+    const tasks = sites.map(async site => {
+        const detail = await fetchNamedDetailFromSite(site, wd);
+        if (detail) {
+            completed.push(detail);
+            if (!firstResolved) {
+                firstResolved = true;
+                resolveFirst(detail);
+            }
+        }
+        return detail;
+    });
+    const full = Promise.all(tasks)
+        .then(results => {
+            const details = results.filter(Boolean);
+            if (!firstResolved) resolveFirst(details[0] || null);
+            if (details.length > 0) setCache(cacheKey, details, CACHE_TTL.multiDetail);
+            return details;
+        })
+        .finally(() => multiDetailRequestInFlight.delete(cacheKey));
+
+    const aggregation = { first, full, snapshot: () => [...completed] };
+    multiDetailRequestInFlight.set(cacheKey, aggregation);
+    return aggregation;
+}
+
 // === 跨站点多源详情（输入影片名或直接给 site_key:id 列表，输出所有站点详情+播放源） ===
 app.get('/api/multi-detail', async (req, res) => {
-    const { wd, keys } = req.query;
-    
+    const { wd, keys, fast } = req.query;
     const sites = getWorkingSites();
-    const results = [];
-    
+
     // 如果提供了 keys（格式: key1:id1,key2:id2），直接按 ID 拉取
     if (keys) {
-        const keyPairs = decodeURIComponent(keys).split(',').map(p => {
-            const [key, id] = p.split(':');
+        const keyPairs = String(keys).split(',').map(p => {
+            const [key, id] = p.split(':', 2);
             return { key, id };
         }).filter(p => p.key && p.id);
-        
-        await Promise.all(keyPairs.map(async ({ key, id }) => {
+
+        const cacheKey = `multi-detail:keys:${keyPairs.map(p => `${p.key}:${p.id}`).join(',')}`;
+        const cachedEntry = getCachedEntry(cacheKey);
+        const cached = Array.isArray(cachedEntry?.data) ? cachedEntry.data : [];
+        const cachedKeys = new Set(cached.map(item => `${item.site_key}:${item.vod_id}`));
+        const completeFromCache = keyPairs.every(({ key, id }) => cachedKeys.has(`${key}:${id}`));
+        if (completeFromCache) return res.json({ list: cached, complete: true });
+
+        const missingPairs = keyPairs.filter(({ key, id }) => !cachedKeys.has(`${key}:${id}`));
+        const results = await Promise.all(missingPairs.map(async ({ key, id }) => {
             const site = sites.find(s => s.key === key);
-            if (!site) return;
-            try {
-                const detailResp = await axios.get(
-                    `${site.api}?ac=detail&ids=${id}&out=json`,
-                    { timeout: 6000 }
-                );
-                const detail = (detailResp.data.list && detailResp.data.list[0]) 
-                    ? detailResp.data.list[0] 
-                    : detailResp.data;
-                if (detail && detail.vod_id) {
-                    results.push({ ...detail, site_key: site.key, site_name: site.name });
-                }
-            } catch (e) {}
+            return site ? fetchSiteDetail(site, id) : null;
         }));
-        
-        results.sort((a, b) => {
-            const aHas = a.vod_pic && a.vod_pic.startsWith('http') ? 1 : 0;
-            const bHas = b.vod_pic && b.vod_pic.startsWith('http') ? 1 : 0;
-            return bHas - aHas;
-        });
-        return res.json({ list: results });
+        const details = [...cached, ...results.filter(Boolean)]
+            .filter((item, index, list) => list.findIndex(other =>
+                other.site_key === item.site_key && String(other.vod_id) === String(item.vod_id)
+            ) === index);
+        const resolvedKeys = new Set(details.map(item => `${item.site_key}:${item.vod_id}`));
+        const complete = keyPairs.every(({ key, id }) => resolvedKeys.has(`${key}:${id}`));
+        if (details.length > 0) {
+            if (complete) setCache(cacheKey, details, CACHE_TTL.multiDetail);
+            else setCachePartial(cacheKey, details, 30 * 1000);
+        }
+        return res.json({ list: details, complete });
     }
-    
+
     // 回退：按名称搜索
     if (!wd) return res.status(400).json({ error: 'Missing wd or keys' });
-    
-    await Promise.all(sites.map(async (site) => {
-        try {
-            const searchResp = await axios.get(
-                `${site.api}?ac=videolist&wd=${encodeURIComponent(wd)}&pg=1&out=json`,
-                { timeout: 8000 }
-            );
-            const list = searchResp.data.list || searchResp.data.data || [];
-            const match = list.find(item => {
-                const name = (item.vod_name || '').replace(/[·・\s\-\[\]【】]/g, '').toLowerCase();
-                const query = wd.replace(/[·・\s\-\[\]【】]/g, '').toLowerCase();
-                return name === query || name.includes(query) || query.includes(name);
-            });
-            if (match) {
-                const detailResp = await axios.get(
-                    `${site.api}?ac=detail&ids=${match.vod_id}&out=json`,
-                    { timeout: 6000 }
-                );
-                const detail = (detailResp.data.list && detailResp.data.list[0]) 
-                    ? detailResp.data.list[0] 
-                    : detailResp.data;
-                if (detail && detail.vod_id) {
-                    results.push({ ...detail, site_key: site.key, site_name: site.name });
-                }
-            }
-        } catch (e) {}
-    }));
-    
-    // 按站点图片质量排序
-    results.sort((a, b) => {
-        const aHas = a.vod_pic && a.vod_pic.startsWith('http') ? 1 : 0;
-        const bHas = b.vod_pic && b.vod_pic.startsWith('http') ? 1 : 0;
-        return bHas - aHas;
+
+    const aggregation = startNamedDetailAggregation(String(wd), sites);
+    if (fast === '1' || fast === 'true') {
+        const first = await withTimeout(aggregation.first, 2200, null);
+        return res.json({ list: first ? [first] : [], complete: false });
+    }
+
+    // 坏站最慢可能经历“搜索 + 详情”两段超时。移动端不应被它拖住：
+    // 先返回 4.5 秒内已完成的线路，剩余任务继续运行并写入服务端缓存。
+    const results = await withTimeout(aggregation.full, 4500, null);
+    res.json({
+        list: results || aggregation.snapshot(),
+        complete: Array.isArray(results),
     });
-    
-    res.json({ list: results });
 });
 
 // === 分类浏览分页接口（按需分页：用户翻到第N页才拉第N页） ===
@@ -1246,60 +1437,70 @@ function startCategoryPrewarm() {
 
 async function fetchFastCategoryFirstPage({ category, fallbackWd, pageSize, metaKey }) {
     const sites = getWorkingSites();
-    const allResults = [];
-    let maxPage = 1;
-    let servedRequest = false;
+    const tasks = [];
+    const controllers = [];
+    const completed = [];
 
-    await Promise.all(sites.map(async (site) => {
+    for (const site of sites) {
         const typeIds = getFastCategoryTypeIds(site.key, category);
-        const siteItems = [];
+        if (typeIds.length === 0) continue;
+        const urls = typeIds.map(typeId => ({
+            typeId,
+            url: `${site.api}?ac=videolist&t=${typeId}&pg=1&out=json`,
+        }));
 
-        const tasks = typeIds.length > 0
-            ? typeIds.map(tid => async () => {
-                try {
-                    const url = `${site.api}?ac=videolist&t=${tid}&pg=1&out=json`;
-                    const r = await axios.get(url, { timeout: 2600 });
-                    const list = r.data.list || r.data.data || [];
-                    if (!Array.isArray(list) || list.length === 0) return [];
-                    servedRequest = true;
-                    const pc = Number(r.data.pagecount) || 1;
-                    maxPage = Math.max(maxPage, pc);
-                    return list.map(item => ({ ...item, site_key: site.key, site_name: site.name, latency: 0 }));
-                } catch { return []; }
-            })
-            : [async () => {
-                try {
-                    const url = `${site.api}?ac=videolist&wd=${encodeURIComponent(fallbackWd)}&pg=1&out=json`;
-                    const r = await axios.get(url, { timeout: 2600 });
-                    const list = r.data.list || r.data.data || [];
-                    if (!Array.isArray(list) || list.length === 0) return [];
-                    servedRequest = true;
-                    const pc = Number(r.data.pagecount) || 1;
-                    maxPage = Math.max(maxPage, pc);
-                    return list.map(item => ({ ...item, site_key: site.key, site_name: site.name, latency: 0 }));
-                } catch { return []; }
-            }];
-
-        const results = await batchLimit(tasks, 2);
-        for (const items of results) {
-            if (items && items.length > 0) siteItems.push(...items);
+        for (const { typeId, url } of urls) {
+            const controller = new AbortController();
+            controllers.push(controller);
+            tasks.push(axios.get(url, { timeout: 4000, signal: controller.signal }).then(r => {
+                const list = r.data.list || r.data.data || [];
+                if (!Array.isArray(list) || list.length === 0) throw new Error('empty category result');
+                const result = {
+                    siteKey: site.key,
+                    typeId,
+                    list: list.map(item => ({ ...item, site_key: site.key, site_name: site.name, latency: 0 })),
+                    maxPage: Number(r.data.pagecount) || 1,
+                    total: Number(r.data.total) || 0,
+                };
+                completed.push(result);
+                return result;
+            }));
         }
-        crossSiteImagePicks(siteItems).forEach(item => allResults.push(item));
-    }));
+    }
 
-    const merged = crossSiteImagePicks(allResults);
-    if (!servedRequest || merged.length === 0) return null;
+    try {
+        // 所有请求已经并发发出；在单请求 4 秒预算内收集全部已响应站点，
+        // 不再收到首个结果就取消其余四站。
+        await Promise.allSettled(tasks);
+    } finally {
+        controllers.forEach(controller => controller.abort());
+    }
 
-    const totalEstimate = maxPage * pageSize;
+    if (completed.length === 0) return null;
+    const fastResults = completed;
+    const siteItems = new Map();
+    for (const site of sites) {
+        const siteResults = fastResults.filter(result => result.siteKey === site.key);
+        const byType = new Map(siteResults.map(result => [result.typeId, result.list]));
+        const items = interleaveSiteItems(byType, getFastCategoryTypeIds(site.key, category));
+        if (items.length > 0) siteItems.set(site.key, items);
+    }
+    const fairItems = interleaveSiteItems(siteItems, sites.map(site => site.key));
+    const merged = crossSiteImagePicks(fairItems);
+    if (merged.length === 0) return null;
+
+    const maxPage = Math.max(...fastResults.map(result => result.maxPage), 1);
+    const reportedTotal = fastResults.reduce((sum, result) => sum + result.total, 0);
+    const totalEstimate = reportedTotal || maxPage * pageSize;
     const existingMeta = categoryMetaCache.get(metaKey) || {};
-    categoryMetaCache.set(metaKey, { ...existingMeta, maxPage, total: totalEstimate });
+    categoryMetaCache.set(metaKey, { ...existingMeta, maxPage, total: totalEstimate, complete: false });
 
     return {
         total: totalEstimate || merged.length,
         page: 1,
         pageSize,
-        totalPages: Math.max(1, maxPage),
-        list: merged.slice(0, pageSize),
+        totalPages: maxPage,
+        list: merged.slice(0, pageSize).map(toMediaCardItem),
         complete: false,
         warming: true,
         serverFiltered: false,
@@ -1341,7 +1542,7 @@ app.post('/api/category', async (req, res) => {
     }
 
     const meta = categoryMetaCache.get(metaKey);
-    if (meta && p > meta.maxPage) {
+    if (meta?.complete === true && p > meta.maxPage) {
         return res.json({ total: meta.total, page: p, pageSize: ps, totalPages: meta.maxPage, list: [], complete: true, outOfRange: true, subCounts: meta.subCounts });
     }
 
@@ -1376,12 +1577,13 @@ app.post('/api/category', async (req, res) => {
     let siteTypeMap = null; // Map<siteKey, [typeId]> — 子分类模式下的精简 type_id 列表
     if (sub && category) {
         const subMap = getSubTypeIds(category, sub);
-        if (subMap) {
-            siteTypeMap = new Map();
-            for (const site of sites) {
-                const tid = subMap[site.key];
-                if (tid) siteTypeMap.set(site.key, [tid]);
-            }
+        if (!subMap) {
+            return res.status(400).json({ error: `Unsupported subType "${sub}" for category "${category}"` });
+        }
+        siteTypeMap = new Map();
+        for (const site of sites) {
+            const tid = subMap[site.key];
+            if (tid) siteTypeMap.set(site.key, [tid]);
         }
     }
     const serverSideFiltered = !!siteTypeMap;
@@ -1396,19 +1598,28 @@ app.post('/api/category', async (req, res) => {
             if (tids && tids.length > 0) return { site, typeIds: tids, useWd: false };
             return { site, typeIds: [], useWd: false }; // 该站点不支持此子分类
         }
-        // 全部模式：使用父+子 type_id 聚合，保证各资源站翻页稳定。
+        // 多数 CMS 的资源实际挂在子类，父分类 t=1/2/3/4 常为空或分页不完整。
+        // 全部模式拉配置中的子类集合；快速首屏则只拉每站两个高频子类。
         if (category) {
             const typeIds = await getSiteCategoryTypeIds(site, category);
-            if (typeIds && typeIds.length > 0) return { site, typeIds, useWd: false };
+            if (typeIds && typeIds.length > 0) {
+                const rootId = SITE_ROOT_TYPE_IDS[site.key]?.[category];
+                const childIds = typeIds.filter(id => id !== rootId);
+                return { site, typeIds: childIds.length > 0 ? childIds : typeIds, useWd: false };
+            }
+            if (Object.prototype.hasOwnProperty.call(SITE_TYPE_IDS[site.key] || {}, category)) {
+                return { site, typeIds: [], useWd: false };
+            }
             return { site, typeIds: [], useWd: true };
         }
         return { site, typeIds: [], useWd: true };
     }));
 
     // 拉取数据
-    const allResults = [];
+    const siteItemsByKey = new Map();
     let maxPage = 1;
     let servedRequest = false;
+    let reportedTotal = 0;
 
     // 第 1 页并发限制：最多 3 个 type_id 同时请求，避免 60 次同时打垮服务
     const REQUEST_CONCURRENCY = p === 1 ? 3 : 8;
@@ -1423,13 +1634,16 @@ app.post('/api/category', async (req, res) => {
                     servedRequest = true;
                     const pc = Number(r.data.pagecount) || 1;
                     maxPage = Math.max(maxPage, pc);
-                    list.forEach(item => allResults.push({ ...item, site_key: site.key, site_name: site.name, latency: 0 }));
+                    reportedTotal += Number(r.data.total) || 0;
+                    siteItemsByKey.set(site.key, list.map(item => ({
+                        ...item, site_key: site.key, site_name: site.name, latency: 0,
+                    })));
                 }
             } catch {}
             return;
         }
         if (typeIds.length === 0) return;
-        const siteItems = [];
+        const typeItemsById = new Map();
         // 并发受控的 type_id 请求
         const tasks = typeIds.map(tid => async () => {
             try {
@@ -1444,17 +1658,24 @@ app.post('/api/category', async (req, res) => {
                 servedRequest = true;
                 const pc = Number(r.data.pagecount) || 1;
                 maxPage = Math.max(maxPage, pc);
-                return list.map(item => ({ ...item, site_key: site.key, site_name: site.name, latency: 0 }));
-            } catch { return []; }
+                return {
+                    typeId: tid,
+                    items: list.map(item => ({ ...item, site_key: site.key, site_name: site.name, latency: 0 })),
+                    total: Number(r.data.total) || 0,
+                };
+            } catch { return { typeId: tid, items: [], total: 0 }; }
         });
         const results = await batchLimit(tasks, REQUEST_CONCURRENCY);
-        for (const items of results) {
-            if (items && items.length > 0) siteItems.push(...items);
+        for (const response of results) {
+            if (response?.items?.length > 0) typeItemsById.set(response.typeId, response.items);
+            reportedTotal += response?.total || 0;
         }
+        const siteItems = interleaveSiteItems(typeItemsById, typeIds);
         const deduped = crossSiteImagePicks(siteItems);
-        deduped.forEach(item => allResults.push(item));
+        if (deduped.length > 0) siteItemsByKey.set(site.key, deduped);
     }));
 
+    const allResults = interleaveSiteItems(siteItemsByKey, sites.map(site => site.key));
     const merged = crossSiteImagePicks(allResults);
 
     // total 估算（子分类模式下直接用 pagecount × pageSize，更准确）
@@ -1462,14 +1683,20 @@ app.post('/api/category', async (req, res) => {
     let effectiveMaxPage = meta?.maxPage || maxPage;
     if (p === 1 && servedRequest && maxPage > 0) {
         effectiveMaxPage = maxPage;
-        totalEstimate = effectiveMaxPage * ps;
-        categoryMetaCache.set(metaKey, { maxPage: effectiveMaxPage, total: totalEstimate });
+        totalEstimate = reportedTotal || effectiveMaxPage * ps;
+        const existingMeta = categoryMetaCache.get(metaKey) || {};
+        categoryMetaCache.set(metaKey, {
+            ...existingMeta,
+            maxPage: effectiveMaxPage,
+            total: totalEstimate,
+            complete: true,
+        });
     } else if (meta) {
         effectiveMaxPage = meta.maxPage;
         totalEstimate = meta.total;
     } else if (merged.length > 0) {
         effectiveMaxPage = maxPage;
-        totalEstimate = effectiveMaxPage * ps;
+        totalEstimate = reportedTotal || effectiveMaxPage * ps;
     }
 
     const outOfRange = !servedRequest && p > 1 && totalEstimate > 0;
@@ -1489,7 +1716,8 @@ app.post('/api/category', async (req, res) => {
                     try {
                         const r = await axios.get(`${site.api}?ac=videolist&t=${tid}&pg=1&out=json`, { timeout: 5000 });
                         const pc = Number(r.data.pagecount) || 0;
-                        total += pc * 30; // pagecount × pageSize 估算该站该子类总量
+                        const limit = Number(r.data.limit) || 20;
+                        total += Number(r.data.total) || pc * limit;
                     } catch {}
                 }
                 counts[label] = total;
@@ -1504,7 +1732,7 @@ app.post('/api/category', async (req, res) => {
         page: p,
         pageSize: ps,
         totalPages: Math.max(1, effectiveMaxPage),
-        list: merged.slice(0, ps),
+        list: merged.slice(0, ps).map(toMediaCardItem),
         complete: true,
         outOfRange,
         serverFiltered: serverSideFiltered,
@@ -1758,10 +1986,8 @@ app.get('/api/detail', async (req, res) => {
     const targetSite = getDB().sites.find(s => s.key === site_key);
     if (!targetSite) return res.status(404).json({ error: "Site not found" });
     try {
-        const response = await axios.get(`${targetSite.api}?ac=detail&ids=${id}&out=json`, { timeout: 6000 });
-        // 外部 API 返回 { code, msg, list: [...] }，取 list[0]
-        const data = response.data;
-        const item = (data.list && data.list[0]) ? data.list[0] : data;
+        const item = await fetchSiteDetail(targetSite, id);
+        if (!item) return res.status(404).json({ error: "Detail not found" });
         res.json(item);
     } catch (e) { res.status(500).json({ error: "Source Error" }); }
 });
@@ -1861,7 +2087,7 @@ if (fs.existsSync(distPath)) {
   app.use(express.static(distPath, { maxAge: '1h' }));
   // SPA fallback：所有非 API 请求返回 index.html
   app.get('*', (req, res, next) => {
-    if (req.path.startsWith('/api')) return next();
+    if (req.path.startsWith('/api') || req.path.startsWith('/dataupdate')) return next();
     const indexPath = path.join(distPath, 'index.html');
     if (fs.existsSync(indexPath)) res.sendFile(indexPath);
     else next();
@@ -1876,5 +2102,5 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`服务已启动: http://localhost:${PORT}`);
   console.log(`  桌面/浏览器访问: http://localhost:${PORT}`);
   console.log(`  Android 模拟器访问: http://10.0.2.2:${PORT}/mobile`);
-  startCategoryPrewarm();
+  if (process.env.DISABLE_CATEGORY_PREWARM !== '1') startCategoryPrewarm();
 });

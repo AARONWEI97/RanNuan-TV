@@ -17,7 +17,6 @@ import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -30,7 +29,6 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.rannuan.tv.data.api.RanNuanApi
 import com.rannuan.tv.ui.screens.category.CategoryScreen
-import com.rannuan.tv.ui.screens.category.prefetchCategoryFirstPages
 import com.rannuan.tv.ui.screens.detail.DetailScreen
 import com.rannuan.tv.ui.screens.home.HomeScreen
 import com.rannuan.tv.ui.screens.player.PlayerScreen
@@ -68,10 +66,6 @@ fun MainNavHost(api: RanNuanApi) {
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = navBackStackEntry?.destination?.route
 
-    LaunchedEffect(Unit) {
-        prefetchCategoryFirstPages(api)
-    }
-
     val bottomBarRoutes = listOf("home", "category", "search", "profile")
     // route 是模式串(如 "category/{type}")，不能用精确匹配，用前缀匹配
     val showBottomBar = currentRoute?.let { route ->
@@ -99,10 +93,10 @@ fun MainNavHost(api: RanNuanApi) {
                                 if (selected) return@NavigationBarItem
                                 navController.navigate(screen.route) {
                                     popUpTo(navController.graph.startDestinationId) {
-                                        saveState = false
+                                        saveState = true
                                     }
                                     launchSingleTop = true
-                                    restoreState = false
+                                    restoreState = true
                                 }
                             },
                             icon = {

@@ -2,6 +2,7 @@
 
 import android.app.Activity
 import android.content.Context
+import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.media.AudioManager
 import android.net.Uri
@@ -55,6 +56,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.List
 import androidx.compose.material.icons.automirrored.outlined.VolumeUp
+import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.outlined.Brightness6
 import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.FastForward
@@ -63,9 +65,13 @@ import androidx.compose.material.icons.outlined.Fullscreen
 import androidx.compose.material.icons.outlined.FullscreenExit
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Lock
+import androidx.compose.material.icons.outlined.FavoriteBorder
+import androidx.compose.material.icons.outlined.MoreHoriz
 import androidx.compose.material.icons.outlined.PlayDisabled
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.SkipNext
+import androidx.compose.material.icons.outlined.SwapHoriz
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material3.AlertDialog
@@ -73,12 +79,12 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -136,7 +142,6 @@ import com.rannuan.tv.R
 import com.rannuan.tv.data.api.RanNuanApi
 import com.rannuan.tv.data.model.MediaDetail
 import com.rannuan.tv.data.model.MediaItem as RelatedMediaItem
-import com.rannuan.tv.ui.theme.Brand300
 import com.rannuan.tv.ui.theme.Brand400
 import com.rannuan.tv.ui.theme.Error500
 import com.rannuan.tv.ui.theme.ShapeCard
@@ -152,10 +157,12 @@ import com.rannuan.tv.ui.theme.Zinc900
 import com.rannuan.tv.ui.theme.Zinc950
 import com.rannuan.tv.ui.theme.component.GlassCard
 import com.rannuan.tv.ui.util.ImageProxy
+import com.rannuan.tv.ui.util.FavoritesStore
 import com.rannuan.tv.ui.util.WatchingHistoryStore
 import com.rannuan.tv.ui.util.formatSourceName
 import com.rannuan.tv.ui.util.stripHtml
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.roundToInt
@@ -166,11 +173,10 @@ import androidx.annotation.OptIn as AndroidOptIn
  *
  * 手势交互（覆盖在 PlayerView 之上的透明手势层）：
  *  - 单击：显隐控制栏
- *  - 双击左半屏 / 右半屏：快退 / 快进 10 秒（YouTube 式扇形动画）
- *  - 水平拖拽：拖动进度，松手 seek（带预览时间弹窗）
+ *  - 双击任意位置：播放 / 暂停
  *  - 左半屏竖向拖拽：调节屏幕亮度
  *  - 右半屏竖向拖拽：调节音量
- *  - 长按：进入 2x 倍速，松手恢复
+ *  - 长按左半屏 / 右半屏：持续 2 倍速快退 / 快进，松手恢复
  *  - 全屏：横屏 + 隐藏系统栏（再点或返回键退出）
  *
  * 控件层采用顶部/底部渐变蒙层 + 半透明图标（对标爱优腾）。
@@ -190,6 +196,9 @@ fun PlayerScreen(
 ) {
     val context = LocalContext.current
     val activity = remember { context.findActivity() }
+    val playerPrefs = remember(context) {
+        context.getSharedPreferences("rannuan_player_settings", Context.MODE_PRIVATE)
+    }
 
     // ── 数据状态 ──
     var detail by remember { mutableStateOf<MediaDetail?>(null) }
@@ -221,16 +230,18 @@ fun PlayerScreen(
     }
     var showControls by remember { mutableStateOf(true) }
     var showEpisodeSheet by remember { mutableStateOf(false) }
+    var showSourceSheet by remember { mutableStateOf(false) }
     var showSpeedMenu by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
     var showInfoDialog by remember { mutableStateOf(false) }
     var isFullscreen by rememberSaveable { mutableStateOf(false) }
-    var skipSeconds by rememberSaveable { mutableIntStateOf(10) }
-    var resizeMode by rememberSaveable { mutableIntStateOf(0) }    // 0=适应 1=拉伸 2=裁剪
-    var playMode by rememberSaveable { mutableIntStateOf(0) }      // 0=顺序 1=单集循环 2=列表循环
-    var mirrorMode by rememberSaveable { mutableIntStateOf(0) }   // 0=正常 1=水平镜像 2=垂直镜像
+    var resizeMode by rememberSaveable { mutableIntStateOf(playerPrefs.getInt("resize_mode", 0)) }
+    var playMode by rememberSaveable { mutableIntStateOf(playerPrefs.getInt("play_mode", 0)) }
+    var mirrorMode by rememberSaveable { mutableIntStateOf(playerPrefs.getInt("mirror_mode", 0)) }
+    var autoSwitchSource by rememberSaveable { mutableStateOf(playerPrefs.getBoolean("auto_switch_source", true)) }
     var playerViewRef by remember { mutableStateOf<PlayerView?>(null) }
     val episodeSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val sourceSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
     // 播放状态
     var currentPosition by remember { mutableLongStateOf(0L) }
@@ -240,9 +251,7 @@ fun PlayerScreen(
     var playbackError by remember { mutableStateOf<String?>(null) }
     var usingProxy by remember { mutableStateOf(false) }
     var forceProxyHls by remember { mutableStateOf(false) }
-    var selectedSpeed by remember { mutableFloatStateOf(1f) }
-    var longPressActive by remember { mutableStateOf(false) }
-    val playbackSpeed = if (longPressActive) 2f else selectedSpeed
+    var selectedSpeed by rememberSaveable { mutableFloatStateOf(playerPrefs.getFloat("playback_speed", 1f)) }
     var isLocked by remember { mutableStateOf(false) }
     var buffering by remember { mutableStateOf(false) }
     var showBufferingHint by remember { mutableStateOf(false) }
@@ -251,6 +260,8 @@ fun PlayerScreen(
     var transferRateText by remember { mutableStateOf("--") }
     var renderedFirstFrame by remember { mutableStateOf(false) }
     var playbackStartedAt by remember { mutableLongStateOf(0L) }
+    var autoSwitchNotice by remember { mutableStateOf<String?>(null) }
+    var favorited by remember { mutableStateOf(false) }
 
     // 相似推荐
     var relatedVideos by remember { mutableStateOf<List<RelatedMediaItem>>(emptyList()) }
@@ -263,11 +274,11 @@ fun PlayerScreen(
     // 拖拽 seek
     var seekDragging by remember { mutableStateOf(false) }
     var seekPreviewMs by remember { mutableLongStateOf(0L) }
-    // 双击 seek 动画
-    var doubleTapSide by remember { mutableStateOf<SeekSide?>(null) }  // null=隐藏
-    var doubleTapCount by remember { mutableIntStateOf(0) }
+    // 长按左右区域持续 2 倍速快退 / 快进
+    var longPressSpeedSide by remember { mutableStateOf<SeekSide?>(null) }
+    var longPressWasPlaying by remember { mutableStateOf(false) }
+    var longPressRewindJob by remember { mutableStateOf<Job?>(null) }
     // 亮度/音量
-    var gestureMode by remember { mutableStateOf<GestureMode?>(null) }
     var brightnessValue by remember { mutableFloatStateOf(-1f) }       // -1 表示系统默认
     var volumeValue by remember { mutableIntStateOf(-1) }
     var showVolumeUi by remember { mutableStateOf(false) }
@@ -288,7 +299,11 @@ fun PlayerScreen(
         else parseSources(detail!!)
     }
     val activeSource = sources.getOrNull(currentSrc)
+    val sourceOptions = remember(sourceDetails, detail) {
+        buildPlayerSourceOptions(sourceDetails, detail)
+    }
     val latestSources by rememberUpdatedState(sources)
+    val latestSourceOptions by rememberUpdatedState(sourceOptions)
     val latestCurrentSrc by rememberUpdatedState(currentSrc)
     val latestCurrentEp by rememberUpdatedState(currentEp)
     val latestPlayMode by rememberUpdatedState(playMode)
@@ -312,23 +327,48 @@ fun PlayerScreen(
         showControls = true
     }
 
-    fun switchToDetail(d: MediaDetail) {
-        if (detail?.siteKey == d.siteKey && detail?.vodId == d.vodId) return
+    fun targetEpisodeIndex(targetSource: PlaySource, preserveEpisode: Boolean): Int {
+        if (!preserveEpisode || targetSource.episodes.isEmpty()) return 0
+        val currentTitle = sources.getOrNull(currentSrc)?.episodes?.getOrNull(currentEp)?.title
+        val exact = currentTitle?.let { title -> targetSource.episodes.indexOfFirst { it.title == title } } ?: -1
+        return if (exact >= 0) exact else currentEp.coerceIn(0, targetSource.episodes.lastIndex)
+    }
+
+    fun switchToRoute(d: MediaDetail, sourceIndex: Int, preserveEpisode: Boolean = true) {
+        val targetSources = parseSources(d)
+        val safeSourceIndex = sourceIndex.coerceIn(0, (targetSources.size - 1).coerceAtLeast(0))
+        val targetSource = targetSources.getOrNull(safeSourceIndex) ?: return
+        if (detail?.siteKey == d.siteKey && detail?.vodId == d.vodId && currentSrc == safeSourceIndex) return
+        val targetEpisode = targetEpisodeIndex(targetSource, preserveEpisode)
         savePlayPosition()
         detail = d
-        currentSrc = 0
-        currentEp = 0
+        currentSrc = safeSourceIndex
+        currentEp = targetEpisode
         pendingResumePos = 0L
         showControls = true
     }
 
     fun switchToLine(idx: Int) {
         if (idx !in sources.indices) return
+        val targetEpisode = targetEpisodeIndex(sources[idx], preserveEpisode = true)
         savePlayPosition()
         currentSrc = idx
-        currentEp = 0
+        currentEp = targetEpisode
         pendingResumePos = 0L
         showControls = true
+    }
+
+    fun switchToNextRoute(): Boolean {
+        val options = latestSourceOptions
+        val currentIndex = options.indexOfFirst {
+            it.detail.siteKey == detail?.siteKey &&
+                it.detail.vodId == detail?.vodId &&
+                it.sourceIndex == currentSrc
+        }
+        val next = options.getOrNull(currentIndex + 1) ?: return false
+        switchToRoute(next.detail, next.sourceIndex, preserveEpisode = true)
+        autoSwitchNotice = "当前线路不可用，已切换至 ${next.displayName}"
+        return true
     }
 
     fun handleEpisodeEnded() {
@@ -384,6 +424,36 @@ fun PlayerScreen(
                 castError = "投屏失败: ${e.message}"
             }
         }
+    }
+
+    fun openCastPanel() {
+        showCastSheet = true
+        castError = null
+        if (castSession != null) return
+        scope.launch {
+            isDiscovering = true
+            discoveredDevices = emptyList()
+            try {
+                discoveredDevices = dlnaController.discoverDevices()
+            } catch (_: Exception) {
+                discoveredDevices = emptyList()
+            }
+            isDiscovering = false
+        }
+    }
+
+    fun shareCurrentVideo() {
+        val d = detail ?: return
+        val episode = sources.getOrNull(currentSrc)?.episodes?.getOrNull(currentEp)?.title.orEmpty()
+        val text = buildString {
+            append("我正在冉暖TV观看《${d.vodName}》")
+            if (episode.isNotBlank()) append(" $episode")
+        }
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TEXT, text)
+        }
+        context.startActivity(Intent.createChooser(intent, "分享影片"))
     }
 
     fun stopCasting() {
@@ -467,7 +537,11 @@ fun PlayerScreen(
             val epTitle = sources.getOrNull(currentSrc)?.episodes?.getOrNull(currentEp)?.title ?: ""
             WatchingHistoryStore.addHistory(
                 context, d.siteKey, d.vodId,
-                d.vodName, d.vodPic ?: "", epTitle
+                d.vodName, d.vodPic ?: "", epTitle,
+                position = pendingResumePos,
+                sourceIndex = currentSrc,
+                episodeIndex = currentEp,
+                preserveExistingPosition = fromError
             )
         }
 
@@ -492,7 +566,12 @@ fun PlayerScreen(
                     bufferedAheadMs = (exoPlayer.bufferedPosition - exoPlayer.currentPosition).coerceAtLeast(0L)
                     // 续播：首次就绪后跳到历史位置（仅执行一次）
                     if (pendingResumePos > 0) {
-                        exoPlayer.seekTo(pendingResumePos.coerceAtMost(duration))
+                        val target = if (duration > 0L) {
+                            pendingResumePos.coerceAtMost(duration)
+                        } else {
+                            pendingResumePos
+                        }
+                        exoPlayer.seekTo(target)
                         pendingResumePos = 0
                     }
                 } else if (state == Player.STATE_ENDED) {
@@ -510,8 +589,10 @@ fun PlayerScreen(
                     forceProxyHls = true
                     tryPlayVideo(proxy = true, fromError = true, forceHlsMime = true)
                 } else {
-                    // 代理也失败 → 显示友好错误信息
-                    playbackError = "当前线路播放失败，请尝试切换其他线路"
+                    // 代理也失败：允许设置为自动尝试下一条线路。
+                    if (!autoSwitchSource || !switchToNextRoute()) {
+                        playbackError = "当前线路播放失败，请尝试切换其他线路"
+                    }
                 }
             }
 
@@ -577,17 +658,31 @@ fun PlayerScreen(
         }
     }
 
-    // 双击 seek 动画：1秒后自动消失；累积叠加跳秒数
-    LaunchedEffect(doubleTapSide) {
-        if (doubleTapSide != null) {
-            delay(800)
-            doubleTapSide = null
-            doubleTapCount = 0
+    // 菜单倍速是常驻设置；长按期间会临时覆盖，松手恢复该值。
+    LaunchedEffect(selectedSpeed) { exoPlayer.setPlaybackSpeed(selectedSpeed) }
+
+    LaunchedEffect(selectedSpeed, resizeMode, playMode, mirrorMode, autoSwitchSource) {
+        playerPrefs.edit()
+            .putFloat("playback_speed", selectedSpeed)
+            .putInt("resize_mode", resizeMode)
+            .putInt("play_mode", playMode)
+            .putInt("mirror_mode", mirrorMode)
+            .putBoolean("auto_switch_source", autoSwitchSource)
+            .apply()
+    }
+
+    LaunchedEffect(autoSwitchNotice) {
+        if (autoSwitchNotice != null) {
+            delay(2600)
+            autoSwitchNotice = null
         }
     }
 
-    // 速度同步（菜单选中倍速 + 长按临时 2x）
-    LaunchedEffect(playbackSpeed) { exoPlayer.setPlaybackSpeed(playbackSpeed) }
+
+    LaunchedEffect(detail?.siteKey, detail?.vodId) {
+        val d = detail
+        favorited = d != null && FavoritesStore.isFavorited(context, d.siteKey, d.vodId)
+    }
 
     LaunchedEffect(buffering, isPlaying, playbackError) {
         if (buffering && !isPlaying && playbackError == null) {
@@ -629,43 +724,65 @@ fun PlayerScreen(
         loading = true; error = null
         try {
             val titleQuery = name
-            val keyParam = keys.takeIf { it.isNotBlank() } ?: "$siteKey:$id"
-            val firstResp = api.getMultiDetail(wd = titleQuery, keys = keyParam)
-            val fallbackResp = if (firstResp.list.isEmpty()) {
-                when {
-                    titleQuery.isNotBlank() -> api.getMultiDetail(wd = titleQuery, keys = "")
-                    keyParam != "$siteKey:$id" -> api.getMultiDetail(wd = "", keys = "$siteKey:$id")
-                    else -> firstResp
-                }
-            } else firstResp
-            val list = fallbackResp.list
-            val primary = list.firstOrNull { it.siteKey == siteKey && it.vodId == id } ?: list.firstOrNull()
-            detail = primary
-            sourceDetails = if (primary != null && list.none { it.siteKey == primary.siteKey && it.vodId == primary.vodId }) {
-                listOf(primary) + list
-            } else {
-                list
+            val direct = runCatching { api.getDetail(siteKey, id) }.getOrNull()?.let { item ->
+                item.copy(
+                    siteKey = item.siteKey.ifBlank { siteKey },
+                    vodId = item.vodId.ifBlank { id }
+                )
             }
-            if (detail == null) error = "未找到影片信息"
+            val fallback = if (direct == null) {
+                val keyParam = keys.takeIf { it.isNotBlank() } ?: "$siteKey:$id"
+                api.getMultiDetail(wd = titleQuery, keys = keyParam).list
+            } else {
+                emptyList()
+            }
+            val primary = direct ?: fallback.firstOrNull { it.siteKey == siteKey && it.vodId == id } ?: fallback.firstOrNull()
+            detail = primary
+            sourceDetails = listOfNotNull(primary)
+            if (primary == null) {
+                error = "未找到影片信息"
+            } else {
+                val loadedSources = parseSources(primary)
+                if (loadedSources.isEmpty()) {
+                    error = "当前站点没有可用播放线路"
+                } else {
+                    currentSrc = sourceIdx.coerceIn(0, loadedSources.lastIndex)
+                    currentEp = epIdx.coerceIn(0, loadedSources[currentSrc].episodes.lastIndex)
+                }
+            }
         } catch (e: Exception) { error = e.message }
         finally { loading = false }
     }
 
-    LaunchedEffect(detail?.vodName, renderedFirstFrame) {
+    LaunchedEffect(detail?.vodName, keys) {
         val d = detail ?: return@LaunchedEffect
-        if (!renderedFirstFrame) return@LaunchedEffect
-        delay(1200)
         val detailTitle = d.vodName.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
+        val preciseKeys = keys.takeIf { it.contains(',') }.orEmpty()
+        if (preciseKeys.isNotBlank()) {
+            delay(350)
+        } else {
+            delay(1200)
+        }
         try {
-            val resp = api.getMultiDetail(wd = detailTitle, keys = "")
+            var resp = api.getMultiDetail(wd = detailTitle, keys = preciseKeys)
             val merged = mutableListOf(d)
-            resp.list.forEach { candidate ->
-                val exists = merged.any { existing ->
-                    existing.siteKey == candidate.siteKey && existing.vodId == candidate.vodId
+            fun appendCandidates(candidates: List<MediaDetail>) {
+                candidates.forEach { candidate ->
+                    val exists = merged.any { existing ->
+                        existing.siteKey == candidate.siteKey && existing.vodId == candidate.vodId
+                    }
+                    if (candidate.vodId.isNotBlank() && !exists) {
+                        merged.add(candidate)
+                    }
                 }
-                if (candidate.vodId.isNotBlank() && !exists) {
-                    merged.add(candidate)
-                }
+            }
+            appendCandidates(resp.list)
+            sourceDetails = merged.toList()
+
+            if (resp.complete == false) {
+                delay(1200)
+                resp = api.getMultiDetail(wd = detailTitle, keys = preciseKeys)
+                appendCandidates(resp.list)
             }
             sourceDetails = merged
         } catch (_: Exception) {
@@ -811,19 +928,65 @@ fun PlayerScreen(
         }
     }
 
-    // 手势层 PointerInput：单击/双击/长按（onPress 感知松手恢复倍速）
-    val tapDetector = Modifier.pointerInput(isLocked) {
+    fun startLongPressSpeed(xPercent: Float) {
+        if (longPressSpeedSide != null) return
+        val side = if (xPercent < 0.5f) SeekSide.LEFT else SeekSide.RIGHT
+        longPressWasPlaying = exoPlayer.isPlaying
+        longPressSpeedSide = side
+        showControls = false
+
+        if (side == SeekSide.RIGHT) {
+            exoPlayer.setPlaybackSpeed(2f)
+            exoPlayer.playWhenReady = true
+            exoPlayer.play()
+        } else {
+            // Media3 不支持负倍速，用高频 seek 模拟连续 2 倍速倒放。
+            exoPlayer.pause()
+            longPressRewindJob?.cancel()
+            longPressRewindJob = scope.launch {
+                while (true) {
+                    val target = (exoPlayer.currentPosition - 200L).coerceAtLeast(0L)
+                    exoPlayer.seekTo(target)
+                    currentPosition = target
+                    delay(100L)
+                }
+            }
+        }
+    }
+
+    fun stopLongPressSpeed() {
+        if (longPressSpeedSide == null) return
+        longPressRewindJob?.cancel()
+        longPressRewindJob = null
+        longPressSpeedSide = null
+        exoPlayer.setPlaybackSpeed(selectedSpeed)
+        if (longPressWasPlaying) {
+            exoPlayer.playWhenReady = true
+            exoPlayer.play()
+        } else {
+            exoPlayer.pause()
+        }
+    }
+
+    // 手势层：单击显隐；双击播放/暂停；长按左右区域持续快退/快进。
+    val tapDetector = Modifier.pointerInput(isLocked, selectedSpeed) {
         if (isLocked) return@pointerInput
         detectTapGestures(
+            onPress = {
+                try {
+                    tryAwaitRelease()
+                } finally {
+                    stopLongPressSpeed()
+                }
+            },
             onTap = { showControls = !showControls },
             onDoubleTap = { offset ->
                 val w = size.width.toFloat().coerceAtLeast(1f)
                 handleDoubleTap(offset.x / w)
             },
-            onLongPress = { longPressActive = true },
-            onPress = {
-                tryAwaitRelease()
-                longPressActive = false
+            onLongPress = { offset ->
+                val w = size.width.toFloat().coerceAtLeast(1f)
+                startLongPressSpeed(offset.x / w)
             }
         )
     }
@@ -907,7 +1070,7 @@ fun PlayerScreen(
                                     Surface(
                                         color = Brand400,
                                         shape = RoundedCornerShape(24.dp),
-                                        modifier = Modifier.clickable { showEpisodeSheet = true }
+                                        modifier = Modifier.clickable { showSourceSheet = true }
                                     ) {
                                         Row(
                                             verticalAlignment = Alignment.CenterVertically,
@@ -963,6 +1126,23 @@ fun PlayerScreen(
                         }
                     }
 
+                    autoSwitchNotice?.let { notice ->
+                        Surface(
+                            color = Color.Black.copy(alpha = 0.72f),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.align(Alignment.TopCenter).padding(top = 68.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Outlined.SwapHoriz, null, tint = Brand400, modifier = Modifier.size(17.dp))
+                                Spacer(Modifier.width(7.dp))
+                                Text(notice, color = Color.White, fontSize = 12.sp)
+                            }
+                        }
+                    }
+
                     // ── 手势层（非锁定时接管所有手势）──
                     if (!isLocked) {
                         Box(
@@ -974,6 +1154,7 @@ fun PlayerScreen(
                                     var startY = 0f
                                     var baselineBrightness = 0f
                                     var baselineVolume = 0
+                                    var baselineSeekPosition = 0L
                                     var volMax = 15
                                     var localGestureMode: GestureMode? = null
 
@@ -982,6 +1163,8 @@ fun PlayerScreen(
                                             localGestureMode = null
                                             startX = offset.x
                                             startY = offset.y
+                                            baselineSeekPosition = exoPlayer.currentPosition.coerceAtLeast(0L)
+                                            seekPreviewMs = baselineSeekPosition
                                             seekDragging = false
 
                                             // 捕获当前亮度基线
@@ -997,12 +1180,9 @@ fun PlayerScreen(
                                             }
                                         },
                                         onDragEnd = {
-                                            when (localGestureMode) {
-                                                GestureMode.SEEK -> {
-                                                    exoPlayer.seekTo(seekPreviewMs)
-                                                    currentPosition = seekPreviewMs
-                                                }
-                                                else -> {}
+                                            if (localGestureMode == GestureMode.SEEK && seekDragging) {
+                                                exoPlayer.seekTo(seekPreviewMs)
+                                                currentPosition = seekPreviewMs
                                             }
                                             seekDragging = false
                                             localGestureMode = null
@@ -1016,7 +1196,7 @@ fun PlayerScreen(
                                             showVolumeUi = false
                                             showBrightnessUi = false
                                         },
-                                        onDrag = { change, dragAmount ->
+                                        onDrag = { change, _ ->
                                             change.consume()
                                             val w = size.width.toFloat().coerceAtLeast(1f)
                                             val h = size.height.toFloat().coerceAtLeast(1f)
@@ -1029,24 +1209,25 @@ fun PlayerScreen(
                                                 // ≈5dp 即可判定，几乎无感知延迟
                                                 if (totalDrag > 16f) {
                                                     val leftHalf = startX < w * 0.5f
-                                                    // 水平位移 > 垂直位移 × 1.5 → seek；否则亮度/音量
                                                     localGestureMode = if (dx > dy * 1.5f) {
-                                                        if (duration > 0) { seekDragging = true; seekPreviewMs = currentPosition; GestureMode.SEEK }
-                                                        else GestureMode.VOLUME
+                                                        seekDragging = true
+                                                        GestureMode.SEEK
                                                     } else {
                                                         if (leftHalf) GestureMode.BRIGHTNESS else GestureMode.VOLUME
                                                     }
-                                                    gestureMode = localGestureMode
                                                 }
                                             }
 
                                             when (localGestureMode) {
                                                 GestureMode.SEEK -> {
-                                                    if (duration > 0) {
-                                                        // 增量式 seek：每帧位移 × 比例，2x 加速更跟手
-                                                        val deltaMs = (dragAmount.x / w) * duration * 2f
-                                                        seekPreviewMs = (seekPreviewMs + deltaMs.toLong()).coerceIn(0, duration)
-                                                        showControls = true
+                                                    val knownDuration = exoPlayer.duration
+                                                        .takeIf { it > 0L }
+                                                        ?: duration.takeIf { it > 0L }
+                                                    if (knownDuration != null) {
+                                                        val deltaX = change.position.x - startX
+                                                        val deltaMs = (deltaX / w * knownDuration).toLong()
+                                                        seekPreviewMs = (baselineSeekPosition + deltaMs)
+                                                            .coerceIn(0L, knownDuration)
                                                     }
                                                 }
                                                 GestureMode.BRIGHTNESS -> {
@@ -1081,24 +1262,11 @@ fun PlayerScreen(
 
                     // ── 浮层控件（统一 BoxScope，避免 align 作用域错误）──
                     Box(Modifier.fillMaxSize()) {
-                        doubleTapSide?.let { side ->
-                            DoubleTapSeekOverlay(
+                        longPressSpeedSide?.let { side ->
+                            LongPressSpeedOverlay(
                                 side = side,
-                                count = doubleTapCount,
                                 modifier = Modifier.fillMaxSize()
                             )
-                        }
-
-                        // 长按加速提示
-                        if (longPressActive) {
-                            Box(
-                                modifier = Modifier
-                                    .align(Alignment.Center)
-                                    .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(20.dp))
-                                    .padding(horizontal = 24.dp, vertical = 14.dp)
-                            ) {
-                                Text("⚡ 长按 2× 加速中", color = Brand400, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                            }
                         }
 
                         // 手势 seek 时的时间预览
@@ -1178,40 +1346,24 @@ fun PlayerScreen(
                                     IconButton(onClick = { handleBack() }) {
                                         Icon(Icons.AutoMirrored.Outlined.ArrowBack, null, tint = iconTint, modifier = Modifier.size(24.dp))
                                     }
-                                    // 标题
-                                    Column(modifier = Modifier.weight(1f).padding(horizontal = 8.dp)) {
-                                        Text(
-                                            d.vodName,
-                                            color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.SemiBold,
-                                            maxLines = 1, overflow = TextOverflow.Ellipsis
-                                        )
-                                        activeSource?.episodes?.getOrNull(currentEp)?.title?.let { ep ->
-                                            Text(ep,
-                                                color = Color.White.copy(alpha = 0.45f),
-                                                fontSize = 11.sp, maxLines = 1,
-                                                modifier = Modifier.padding(top = 2.dp))
-                                        }
-                                    }
+                                    val episodeLabel = activeSource?.episodes?.getOrNull(currentEp)?.title.orEmpty()
+                                    val sourceLabel = activeSource?.name.orEmpty()
+                                    Text(
+                                        buildString {
+                                            append(d.vodName)
+                                            if (episodeLabel.isNotBlank()) append("  $episodeLabel")
+                                            if (sourceLabel.isNotBlank()) append("  [$sourceLabel]")
+                                        },
+                                        color = Color.White,
+                                        fontSize = 16.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
+                                    )
                                     // 投屏
                                     IconButton(
-                                        onClick = {
-                                            if (castSession != null) {
-                                                // 已投屏中：打开控制面板
-                                                showCastSheet = true
-                                            } else {
-                                                // 未投屏：搜索设备
-                                                showCastSheet = true
-                                                castError = null
-                                                scope.launch {
-                                                    isDiscovering = true
-                                                    discoveredDevices = emptyList()
-                                                    try {
-                                                        discoveredDevices = dlnaController.discoverDevices()
-                                                    } catch (_: Exception) {}
-                                                    isDiscovering = false
-                                                }
-                                            }
-                                        },
+                                        onClick = { openCastPanel() },
                                         modifier = Modifier.size(40.dp)
                                     ) {
                                         Icon(
@@ -1221,15 +1373,14 @@ fun PlayerScreen(
                                             modifier = Modifier.size(20.dp)
                                         )
                                     }
-                                    // 设置
                                     IconButton(
-                                        onClick = { showSettings = true },
+                                        onClick = {
+                                            showSourceSheet = false
+                                            showSettings = true
+                                        },
                                         modifier = Modifier.size(40.dp)
                                     ) {
-                                        Icon(
-                                            Icons.Outlined.Settings,
-                                            null, tint = iconTint, modifier = Modifier.size(20.dp)
-                                        )
+                                        Icon(Icons.Outlined.MoreHoriz, "更多设置", tint = iconTint, modifier = Modifier.size(24.dp))
                                     }
                                 }
                             }
@@ -1251,8 +1402,19 @@ fun PlayerScreen(
                                 }
                             }
                         }
+                        if (isFullscreen && showControls && !isLocked) {
+                            IconButton(
+                                onClick = { isLocked = true },
+                                modifier = Modifier
+                                    .align(Alignment.CenterStart)
+                                    .padding(start = 10.dp)
+                                    .size(42.dp)
+                            ) {
+                                Icon(Icons.Outlined.Lock, "锁定控制", tint = iconTintSub, modifier = Modifier.size(22.dp))
+                            }
+                        }
 
-                        // ═══ 底部控制栏（单行布局：播放/暂停 + 进度条 + 时间 + 全屏）═══
+                        // ═══ 底部控制栏：进度与操作分层，横屏显示快捷功能标签 ═══
                         OverlayAnimatedVisibility(
                             visible = showControls && !isLocked,
                             modifier = Modifier.align(Alignment.BottomCenter)
@@ -1261,14 +1423,50 @@ fun PlayerScreen(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .background(bottomControlGradient())
+                                    .padding(horizontal = if (isFullscreen) 22.dp else 12.dp)
+                                    .padding(top = 8.dp, bottom = if (isFullscreen) 10.dp else 4.dp)
                             ) {
+                                if (isFullscreen) {
+                                    Row(
+                                        Modifier.fillMaxWidth(),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            if (seekDragging) formatTime(seekPreviewMs) else formatTime(currentPosition),
+                                            color = Color.White.copy(alpha = 0.86f),
+                                            fontSize = 11.sp,
+                                            modifier = Modifier.width(44.dp)
+                                        )
+                                        if (duration > 0) {
+                                            Box(Modifier.weight(1f).padding(horizontal = 8.dp)) {
+                                                PlayerSeekBar(
+                                                    position = if (seekDragging) seekPreviewMs else currentPosition,
+                                                    duration = duration,
+                                                    buffered = buffered,
+                                                    onSeek = { ms -> seekDragging = true; seekPreviewMs = ms },
+                                                    onSeekFinished = { ms ->
+                                                        exoPlayer.seekTo(ms)
+                                                        currentPosition = ms
+                                                        seekDragging = false
+                                                    }
+                                                )
+                                            }
+                                        } else {
+                                            Spacer(Modifier.weight(1f))
+                                        }
+                                        Text(
+                                            formatTime(duration),
+                                            color = Color.White.copy(alpha = 0.48f),
+                                            fontSize = 11.sp,
+                                            modifier = Modifier.width(44.dp),
+                                            textAlign = androidx.compose.ui.text.style.TextAlign.End
+                                        )
+                                    }
+                                }
                                 Row(
-                                    Modifier.fillMaxWidth()
-                                        .padding(horizontal = if (isFullscreen) 20.dp else 12.dp)
-                                        .padding(bottom = 2.dp),
+                                    Modifier.fillMaxWidth().height(46.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    // 播放/暂停
                                     IconButton(
                                         onClick = {
                                             if (isPlaying) {
@@ -1278,14 +1476,45 @@ fun PlayerScreen(
                                                 exoPlayer.play()
                                             }
                                         },
-                                        modifier = Modifier.size(40.dp)
+                                        modifier = Modifier.size(42.dp)
                                     ) {
                                         Icon(
                                             if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
                                             null, tint = iconTint, modifier = Modifier.size(26.dp)
                                         )
                                     }
-                                    // 下一集（有下一集就固定显示）
+                                    if (!isFullscreen) {
+                                        Text(
+                                            if (seekDragging) formatTime(seekPreviewMs) else formatTime(currentPosition),
+                                            color = Color.White.copy(alpha = 0.76f),
+                                            fontSize = 10.sp,
+                                            modifier = Modifier.width(40.dp)
+                                        )
+                                        if (duration > 0) {
+                                            Box(Modifier.weight(1f).padding(horizontal = 4.dp)) {
+                                                PlayerSeekBar(
+                                                    position = if (seekDragging) seekPreviewMs else currentPosition,
+                                                    duration = duration,
+                                                    buffered = buffered,
+                                                    onSeek = { ms -> seekDragging = true; seekPreviewMs = ms },
+                                                    onSeekFinished = { ms ->
+                                                        exoPlayer.seekTo(ms)
+                                                        currentPosition = ms
+                                                        seekDragging = false
+                                                    }
+                                                )
+                                            }
+                                        } else {
+                                            Spacer(Modifier.weight(1f))
+                                        }
+                                        Text(
+                                            formatTime(duration),
+                                            color = Color.White.copy(alpha = 0.48f),
+                                            fontSize = 10.sp,
+                                            modifier = Modifier.width(40.dp),
+                                            textAlign = androidx.compose.ui.text.style.TextAlign.End
+                                        )
+                                    }
                                     val hasNextEp = isFullscreen && (activeSource?.let { currentEp + 1 < it.episodes.size } ?: false)
                                     if (hasNextEp) {
                                         IconButton(
@@ -1294,81 +1523,54 @@ fun PlayerScreen(
                                         ) {
                                             Icon(
                                                 Icons.Outlined.SkipNext, null,
-                                                tint = Brand400, modifier = Modifier.size(22.dp)
+                                                tint = iconTint, modifier = Modifier.size(21.dp)
                                             )
                                         }
                                     }
-                                    // 时间（当前）
-                                    Text(
-                                        if (seekDragging) formatTime(seekPreviewMs) else formatTime(currentPosition),
-                                        color = Color.White.copy(alpha = 0.85f), fontSize = 11.sp,
-                                        modifier = Modifier.padding(start = 4.dp, end = 8.dp)
-                                    )
-                                    // 进度条（weight 撑满中间）
-                                    if (duration > 0) {
-                                        Box(Modifier.weight(1f)) {
-                                            PlayerSeekBar(
-                                                position = if (seekDragging) seekPreviewMs else currentPosition,
-                                                duration = duration,
-                                                buffered = buffered,
-                                                onSeek = { ms -> seekDragging = true; seekPreviewMs = ms },
-                                                onSeekFinished = { ms ->
-                                                    exoPlayer.seekTo(ms); currentPosition = ms
-                                                    seekDragging = false
+                                    if (isFullscreen) Spacer(Modifier.weight(1f)) else Spacer(Modifier.width(2.dp))
+
+                                    if (isFullscreen) {
+                                        Box {
+                                            PlayerTextAction(
+                                                label = speedLabel(selectedSpeed),
+                                                active = selectedSpeed != 1f,
+                                                onClick = { showSpeedMenu = !showSpeedMenu }
+                                            )
+                                            DropdownMenu(
+                                                expanded = showSpeedMenu,
+                                                onDismissRequest = { showSpeedMenu = false },
+                                                offset = DpOffset(0.dp, (-180).dp)
+                                            ) {
+                                                listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f).forEach { s ->
+                                                    DropdownMenuItem(
+                                                        text = {
+                                                            Text(
+                                                                "${s}×" + if (s == 1f) "（默认）" else "",
+                                                                color = if (s == selectedSpeed) Brand400 else Color.White
+                                                            )
+                                                        },
+                                                        onClick = { selectedSpeed = s; showSpeedMenu = false }
+                                                    )
                                                 }
-                                            )
-                                        }
-                                    } else {
-                                        Spacer(Modifier.weight(1f))
-                                    }
-                                    // 时间（总时长）
-                                    Text(
-                                        formatTime(duration),
-                                        color = Color.White.copy(alpha = 0.45f), fontSize = 11.sp,
-                                        modifier = Modifier.padding(start = 8.dp, end = 4.dp)
-                                    )
-                                    // 倍速
-                                    Box {
-                                        Text(
-                                            if (longPressActive) "2×" else speedLabel(selectedSpeed),
-                                            color = if (selectedSpeed != 1f || longPressActive) Brand400 else iconTintSub,
-                                            fontSize = 12.sp, fontWeight = FontWeight.Medium,
-                                            modifier = Modifier
-                                                .clickable(
-                                                    interactionSource = remember { MutableInteractionSource() },
-                                                    indication = null
-                                                ) { showSpeedMenu = !showSpeedMenu }
-                                                .padding(horizontal = 8.dp, vertical = 8.dp)
-                                        )
-                                        DropdownMenu(
-                                            expanded = showSpeedMenu,
-                                            onDismissRequest = { showSpeedMenu = false },
-                                            offset = DpOffset(0.dp, (-180).dp)
-                                        ) {
-                                            listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f).forEach { s ->
-                                                DropdownMenuItem(
-                                                    text = {
-                                                        Text(
-                                                            "${s}×" + if (s == 1f) "（默认）" else "",
-                                                            color = if (s == selectedSpeed) Brand400 else Color.White
-                                                        )
-                                                    },
-                                                    onClick = { selectedSpeed = s; showSpeedMenu = false }
-                                                )
                                             }
                                         }
+                                        PlayerTextAction(
+                                            label = "播放源",
+                                            active = sourceOptions.size > 1,
+                                            onClick = {
+                                                showSettings = false
+                                                showSourceSheet = true
+                                            }
+                                        )
+                                        PlayerTextAction(
+                                            label = "选集",
+                                            onClick = { showEpisodeSheet = true },
+                                            active = activeSource?.episodes?.size?.let { it > 1 } == true
+                                        )
                                     }
-                                    // 选集
-                                    IconButton(
-                                        onClick = { showEpisodeSheet = true },
-                                        modifier = Modifier.size(40.dp)
-                                    ) {
-                                        Icon(Icons.AutoMirrored.Outlined.List, null, tint = iconTint, modifier = Modifier.size(22.dp))
-                                    }
-                                    // 全屏
                                     IconButton(
                                         onClick = { isFullscreen = !isFullscreen },
-                                        modifier = Modifier.size(40.dp)
+                                        modifier = Modifier.size(38.dp)
                                     ) {
                                         Icon(
                                             if (isFullscreen) Icons.Outlined.FullscreenExit else Icons.Outlined.Fullscreen,
@@ -1408,22 +1610,62 @@ fun PlayerScreen(
                              ) {
                                  PlayerSettingsPanel(
                                      selectedSpeed = selectedSpeed,
-                                     skipSeconds = skipSeconds,
                                      resizeMode = resizeMode,
                                      playMode = playMode,
                                      mirrorMode = mirrorMode,
+                                     autoSwitchSource = autoSwitchSource,
+                                     usingProxy = usingProxy,
+                                     transferRateText = transferRateText,
                                      onSpeedChange = { selectedSpeed = it },
-                                     onSkipChange = { skipSeconds = it },
                                      onResizeChange = { resizeMode = it },
                                      onPlayModeChange = { playMode = it },
                                      onMirrorChange = { mirrorMode = it },
+                                     onAutoSwitchChange = { autoSwitchSource = it },
                                      onClose = { showSettings = false }
                                  )
                              }
-                         }
-                     }
-                }
-            }
+                          }
+                      }
+
+                    androidx.compose.animation.AnimatedVisibility(
+                        visible = showSourceSheet && isFullscreen,
+                        enter = slideInHorizontally(initialOffsetX = { it }),
+                        exit = slideOutHorizontally(targetOffsetX = { it }),
+                        modifier = Modifier.align(Alignment.CenterEnd)
+                    ) {
+                        Box(Modifier.fillMaxSize()) {
+                            Box(
+                                Modifier
+                                    .fillMaxSize()
+                                    .background(Color.Black.copy(alpha = 0.28f))
+                                    .clickable(
+                                        interactionSource = remember { MutableInteractionSource() },
+                                        indication = null
+                                    ) { showSourceSheet = false }
+                            )
+                            Box(
+                                Modifier
+                                    .fillMaxHeight()
+                                    .fillMaxWidth(0.38f)
+                                    .align(Alignment.CenterEnd)
+                                    .background(Zinc950.copy(alpha = 0.97f))
+                            ) {
+                                SourceSheetContent(
+                                    options = sourceOptions,
+                                    currentDetail = detail,
+                                    currentSourceIndex = currentSrc,
+                                    currentEpisode = currentEp,
+                                    usingProxy = usingProxy,
+                                    onSelect = { option ->
+                                        switchToRoute(option.detail, option.sourceIndex, preserveEpisode = true)
+                                        showSourceSheet = false
+                                    }
+                                )
+                            }
+                        }
+                    }
+                 }
+             }
 
             // ═══ 详情区域（全屏时隐藏，精简布局：标题→线路→选集横滑→推荐）═══
             if (!isFullscreen) {
@@ -1459,42 +1701,16 @@ fun PlayerScreen(
                         }
                     }
 
-                    // ── 播放源（站点）──
-                    if (sourceDetails.isNotEmpty()) {
-                        item {
-                            Spacer(Modifier.height(12.dp))
-                            Text("播放源", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                            Spacer(Modifier.height(8.dp))
-                            Row(
-                                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                sourceDetails.forEach { sourceDetail ->
-                                    val selected = sourceDetail.siteKey == d.siteKey && sourceDetail.vodId == d.vodId
-                                    FilterChip(
-                                        selected = selected,
-                                        onClick = {
-                                            if (sourceDetails.size > 1) switchToDetail(sourceDetail)
-                                        },
-                                        label = {
-                                            Text(
-                                                sourceDetail.siteName.takeIf { it.isNotBlank() } ?: sourceDetail.siteKey,
-                                                fontSize = 12.sp,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis
-                                            )
-                                        },
-                                        colors = FilterChipDefaults.filterChipColors(
-                                            selectedContainerColor = Brand400.copy(alpha = 0.18f),
-                                            selectedLabelColor = Brand400,
-                                            containerColor = Zinc800,
-                                            labelColor = Zinc400
-                                        ),
-                                        shape = ShapeChip
-                                    )
-                                }
-                            }
-                        }
+                    item {
+                        Spacer(Modifier.height(16.dp))
+                        PortraitPlayerActions(
+                            favorited = favorited,
+                            onSource = { showSourceSheet = true },
+                            onEpisode = { showEpisodeSheet = true },
+                            onCast = { openCastPanel() },
+                            onFavorite = { favorited = FavoritesStore.toggle(context, d) },
+                            onShare = { shareCurrentVideo() }
+                        )
                     }
 
                     // ── 选集横滑条（单行，左滑查看更多）──
@@ -1645,6 +1861,31 @@ fun PlayerScreen(
                         onEpisodeSelect = { idx -> switchToEpisode(idx); showEpisodeSheet = false }
                     )
                 }
+            }
+        }
+
+        if (showSourceSheet && !isFullscreen) {
+            ModalBottomSheet(
+                onDismissRequest = { showSourceSheet = false },
+                sheetState = sourceSheetState,
+                containerColor = Zinc900,
+                dragHandle = {
+                    Box(Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 2.dp), contentAlignment = Alignment.Center) {
+                        Box(Modifier.width(34.dp).height(3.dp).background(Zinc700, RoundedCornerShape(2.dp)))
+                    }
+                }
+            ) {
+                SourceSheetContent(
+                    options = sourceOptions,
+                    currentDetail = detail,
+                    currentSourceIndex = currentSrc,
+                    currentEpisode = currentEp,
+                    usingProxy = usingProxy,
+                    onSelect = { option ->
+                        switchToRoute(option.detail, option.sourceIndex, preserveEpisode = true)
+                        showSourceSheet = false
+                    }
+                )
             }
         }
 
@@ -1914,21 +2155,23 @@ fun PlayerScreen(
 /**
  * 播放设置侧滑面板。
  *
- * 设置项按使用场景分组：播放行为、画面、手势跳秒。比连续 chip 更容易扫读，
+ * 设置项按使用场景分组：播放行为和画面。比连续 chip 更容易扫读，
  * 也能在横屏时保持足够触摸面积。
  */
 @Composable
 private fun PlayerSettingsPanel(
     selectedSpeed: Float,
-    skipSeconds: Int,
     resizeMode: Int,
     playMode: Int,
     mirrorMode: Int,
+    autoSwitchSource: Boolean,
+    usingProxy: Boolean,
+    transferRateText: String,
     onSpeedChange: (Float) -> Unit,
-    onSkipChange: (Int) -> Unit,
     onResizeChange: (Int) -> Unit,
     onPlayModeChange: (Int) -> Unit,
     onMirrorChange: (Int) -> Unit,
+    onAutoSwitchChange: (Boolean) -> Unit,
     onClose: () -> Unit
 ) {
     LazyColumn(
@@ -1944,8 +2187,8 @@ private fun PlayerSettingsPanel(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Column {
-                    Text("播放设置", color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
-                    Text("仅影响当前播放器", color = Zinc500, fontSize = 11.sp, modifier = Modifier.padding(top = 2.dp))
+                    Text("播放器设置", color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                    Text("播放偏好", color = Zinc500, fontSize = 11.sp, modifier = Modifier.padding(top = 2.dp))
                 }
                 IconButton(onClick = onClose, modifier = Modifier.size(34.dp)) {
                     Icon(
@@ -1955,6 +2198,34 @@ private fun PlayerSettingsPanel(
                         modifier = Modifier.size(18.dp)
                     )
                 }
+            }
+        }
+
+        item {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    Modifier.size(7.dp).background(if (usingProxy) Brand400 else Color(0xFF5ED59A), CircleShape)
+                )
+                Spacer(Modifier.width(9.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(if (usingProxy) "代理播放" else "源站直连", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                    Text("实时网速 $transferRateText", color = Zinc500, fontSize = 10.sp)
+                }
+            }
+        }
+
+        item {
+            SettingGroup(title = "线路") {
+                PlayerSettingToggleRow(
+                    title = "失败自动换源",
+                    checked = autoSwitchSource,
+                    onCheckedChange = onAutoSwitchChange
+                )
             }
         }
 
@@ -1994,16 +2265,6 @@ private fun PlayerSettingsPanel(
             }
         }
 
-        item {
-            SettingGroup(title = "手势") {
-                SettingsSegmentedRow(
-                    title = "快进/快退",
-                    options = listOf(5 to "5s", 10 to "10s", 15 to "15s", 30 to "30s"),
-                    selected = skipSeconds,
-                    onSelect = onSkipChange
-                )
-            }
-        }
     }
 }
 
@@ -2012,16 +2273,35 @@ private fun SettingGroup(
     title: String,
     content: @Composable () -> Unit
 ) {
-    Surface(
-        color = Zinc900.copy(alpha = 0.92f),
-        shape = RoundedCornerShape(16.dp),
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        Column(Modifier.padding(horizontal = 12.dp, vertical = 12.dp)) {
-            Text(title, color = Zinc300, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.height(10.dp))
-            content()
+    Column(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+        Text(title, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(10.dp))
+        content()
+        Spacer(Modifier.height(14.dp))
+        Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.06f)))
+    }
+}
+
+@Composable
+private fun PlayerSettingToggleRow(
+    title: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f).padding(end = 12.dp)) {
+            Text(title, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Medium)
         }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = Color.White,
+                checkedTrackColor = Brand400,
+                uncheckedThumbColor = Zinc400,
+                uncheckedTrackColor = Zinc700
+            )
+        )
     }
 }
 
@@ -2037,30 +2317,37 @@ private fun <T> SettingsSegmentedRow(
         Spacer(Modifier.height(7.dp))
         Row(
             Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
+            horizontalArrangement = Arrangement.spacedBy(2.dp)
         ) {
             options.forEach { (value, label) ->
                 val isSelected = value == selected
-                Surface(
-                    color = if (isSelected) Brand400.copy(alpha = 0.20f) else Zinc800,
-                    shape = RoundedCornerShape(10.dp),
+                Column(
                     modifier = Modifier
                         .weight(1f)
                         .height(34.dp)
-                        .clickable { onSelect(value) }
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) { onSelect(value) },
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
                 ) {
-                    Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
-                        Text(
-                            label,
-                            color = if (isSelected) Brand400 else Zinc300,
-                            fontSize = 11.sp,
-                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                            modifier = Modifier.padding(horizontal = 4.dp)
-                        )
-                    }
+                    Text(
+                        label,
+                        color = if (isSelected) Color.White else Zinc500,
+                        fontSize = 12.sp,
+                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Box(
+                        Modifier
+                            .width(18.dp)
+                            .height(2.dp)
+                            .background(if (isSelected) Brand400 else Color.Transparent, CircleShape)
+                    )
                 }
             }
         }
@@ -2088,6 +2375,88 @@ private fun OverlayAnimatedVisibility(
         exit = fadeOut(),
         content = content
     )
+}
+
+@Composable
+private fun SourceSheetContent(
+    options: List<PlayerSourceOption>,
+    currentDetail: MediaDetail?,
+    currentSourceIndex: Int,
+    currentEpisode: Int,
+    usingProxy: Boolean,
+    onSelect: (PlayerSourceOption) -> Unit
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)
+    ) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("播放线路", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "${options.size} 条可用线路 · 当前${if (usingProxy) "代理" else "直连"}",
+                    color = Zinc500,
+                    fontSize = 10.sp
+                )
+            }
+            Text("第 ${currentEpisode + 1} 集", color = Brand400, fontSize = 11.sp)
+        }
+        Spacer(Modifier.height(10.dp))
+
+        if (options.isEmpty()) {
+            Box(Modifier.fillMaxWidth().height(96.dp), contentAlignment = Alignment.Center) {
+                Text("暂无其他线路", color = Zinc500, fontSize = 12.sp)
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxWidth().heightIn(max = 320.dp),
+                contentPadding = PaddingValues(bottom = 16.dp)
+            ) {
+                options.forEach { option ->
+                    item(key = "${option.detail.siteKey}:${option.detail.vodId}:${option.sourceIndex}") {
+                        val selected = option.detail.siteKey == currentDetail?.siteKey &&
+                            option.detail.vodId == currentDetail.vodId &&
+                            option.sourceIndex == currentSourceIndex
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onSelect(option) }
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 11.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Box(
+                                    Modifier
+                                        .size(8.dp)
+                                        .background(if (selected) Brand400 else Zinc600, CircleShape)
+                                )
+                                Spacer(Modifier.width(10.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        option.displayName,
+                                        color = if (selected) Color.White else Zinc300,
+                                        fontSize = 12.sp,
+                                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        "${option.siteName} · ${option.episodeCount} 集",
+                                        color = Zinc500,
+                                        fontSize = 10.sp
+                                    )
+                                }
+                                if (selected) {
+                                    Text("播放中", color = Brand400, fontSize = 10.sp)
+                                }
+                            }
+                            Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.055f)))
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /** 选集底部 Sheet 内容 — 移动端优化：紧凑行列、去标题、高触达 */
@@ -2392,25 +2761,90 @@ private fun PlayerSeekBar(
     }
 }
 
-/** 统一风格播放器控制按钮：半透明圆形背景 + 白色图标 */
 @Composable
-private fun PlayerCtrlIcon(
+private fun PortraitPlayerActions(
+    favorited: Boolean,
+    onSource: () -> Unit,
+    onEpisode: () -> Unit,
+    onCast: () -> Unit,
+    onFavorite: () -> Unit,
+    onShare: () -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        PortraitPlayerAction(Icons.Outlined.SwapHoriz, "换源", onClick = onSource)
+        PortraitPlayerAction(Icons.AutoMirrored.Outlined.List, "选集", onClick = onEpisode)
+        PortraitPlayerAction(CastIcon, "投屏", onClick = onCast)
+        PortraitPlayerAction(
+            if (favorited) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
+            if (favorited) "已收藏" else "收藏",
+            active = favorited,
+            onClick = onFavorite
+        )
+        PortraitPlayerAction(Icons.Outlined.Share, "分享", onClick = onShare)
+    }
+}
+
+@Composable
+private fun PortraitPlayerAction(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
-    onClick: () -> Unit,
-    size: Int = 40
+    label: String,
+    active: Boolean = false,
+    onClick: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .width(58.dp)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = onClick
+            )
+            .padding(vertical = 5.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Icon(
+            icon,
+            contentDescription = label,
+            tint = if (active) Brand400 else Color.White.copy(alpha = 0.88f),
+            modifier = Modifier.size(27.dp)
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            label,
+            color = if (active) Brand400 else Zinc500,
+            fontSize = 11.sp,
+            maxLines = 1
+        )
+    }
+}
+
+@Composable
+private fun PlayerTextAction(
+    label: String,
+    active: Boolean = false,
+    onClick: () -> Unit
 ) {
     Box(
         modifier = Modifier
-            .size(size.dp)
-            .clip(CircleShape)
-            .background(Color.White.copy(alpha = 0.08f))
+            .height(36.dp)
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
-                indication = null
-            ) { onClick() },
+                indication = null,
+                onClick = onClick
+            )
+            .padding(horizontal = 12.dp),
         contentAlignment = Alignment.Center
     ) {
-        Icon(icon, null, tint = Color.White.copy(alpha = 0.9f), modifier = Modifier.size((size * 0.55).toInt().dp))
+        Text(
+            label,
+            color = if (active) Brand400 else Color.White.copy(alpha = 0.86f),
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1
+        )
     }
 }
 
@@ -2455,13 +2889,15 @@ private fun SideGestureBar(icon: androidx.compose.ui.graphics.vector.ImageVector
     }
 }
 
-/** YouTube 式双击 seek 扇形叠加动画 */
+/** 长按倍速反馈固定居中，避免在手指下方或屏幕边缘难以辨认。 */
 @Composable
-private fun DoubleTapSeekOverlay(side: SeekSide, count: Int, modifier: Modifier = Modifier) {
-    val alignment = if (side == SeekSide.LEFT) Alignment.CenterStart else Alignment.CenterEnd
-    Box(modifier = modifier) {
+private fun LongPressSpeedOverlay(side: SeekSide, modifier: Modifier = Modifier) {
+    Box(modifier = modifier, contentAlignment = Alignment.Center) {
         Column(
-            modifier = Modifier.align(alignment).padding(horizontal = 52.dp),
+            modifier = Modifier
+                .clip(RoundedCornerShape(12.dp))
+                .background(Color.Black.copy(alpha = 0.68f))
+                .padding(horizontal = 22.dp, vertical = 14.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Box(
@@ -2473,14 +2909,13 @@ private fun DoubleTapSeekOverlay(side: SeekSide, count: Int, modifier: Modifier 
                     null, tint = Color.White.copy(alpha = 0.9f), modifier = Modifier.size(34.dp)
                 )
             }
-            Spacer(Modifier.height(6.dp))
-            Surface(color = Color.Black.copy(alpha = 0.55f), shape = RoundedCornerShape(8.dp)) {
-                Text(
-                    if (side == SeekSide.LEFT) "-${count * 10}s" else "+${count * 10}s",
-                    color = Brand300, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp)
-                )
-            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                if (side == SeekSide.LEFT) "2.0×  快退" else "2.0×  快进",
+                color = Color.White,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold
+            )
         }
     }
 }
@@ -2734,6 +3169,34 @@ private fun parseSources(d: MediaDetail): List<PlaySource> {
         val rawName = fromParts.getOrElse(i) { "线路${i + 1}" }.trim()
         PlaySource(formatSourceName(rawName, i, d.siteKey), eps)
     }.filter { it.episodes.isNotEmpty() }
+}
+
+private data class PlayerSourceOption(
+    val detail: MediaDetail,
+    val sourceIndex: Int,
+    val displayName: String,
+    val siteName: String,
+    val episodeCount: Int
+)
+
+private fun buildPlayerSourceOptions(
+    sourceDetails: List<MediaDetail>,
+    currentDetail: MediaDetail?
+): List<PlayerSourceOption> {
+    val details = (listOfNotNull(currentDetail) + sourceDetails)
+        .distinctBy { "${it.siteKey}:${it.vodId}" }
+    return details.flatMap { detail ->
+        val siteName = detail.siteName.takeIf { it.isNotBlank() } ?: detail.siteKey.ifBlank { "视频源" }
+        parseSources(detail).mapIndexed { index, source ->
+            PlayerSourceOption(
+                detail = detail,
+                sourceIndex = index,
+                displayName = source.name.ifBlank { "$siteName 线路${index + 1}" },
+                siteName = siteName,
+                episodeCount = source.episodes.size
+            )
+        }
+    }
 }
 
 private data class PlaySource(val name: String, val episodes: List<PlayEpisode>)

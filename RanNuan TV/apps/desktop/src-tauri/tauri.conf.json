@@ -6,7 +6,7 @@
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
     "beforeDevCommand": "pnpm dev",
-    "beforeBuildCommand": "pnpm build"
+    "beforeBuildCommand": "node src-tauri/prepare-backend.cjs && pnpm build"
   },
   "app": {
     "withGlobalTauri": true,
@@ -31,7 +31,11 @@
     "active": true,
     "targets": "all",
     "resources": {
-      "../../../server/": "server/"
+      "../../../server/server.js": "server/server.js",
+      "../../../server/actorIndex.js": "server/actorIndex.js",
+      "../../../server/package.json": "server/package.json",
+      "../../../server/node_modules/": "server/node_modules/",
+      "../../../server/node-runtime/": "server/node-runtime/"
     },
     "icon": [
       "icons/icon.ico",      

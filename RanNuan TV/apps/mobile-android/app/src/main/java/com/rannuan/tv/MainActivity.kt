@@ -10,6 +10,7 @@ import com.rannuan.tv.data.api.RanNuanApi
 import com.rannuan.tv.ui.navigation.MainNavHost
 import com.rannuan.tv.ui.screens.SplashScreen
 import com.rannuan.tv.ui.theme.RanNuanTheme
+import com.rannuan.tv.ui.update.AppUpdateOverlay
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -34,6 +35,7 @@ class MainActivity : ComponentActivity() {
                     SplashScreen(onFinish = { showSplash = false })
                 } else {
                     MainNavHost(api = api)
+                    AppUpdateOverlay()
                 }
             }
         }

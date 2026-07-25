@@ -35,8 +35,15 @@ interface RanNuanApi {
     @GET("/api/multi-detail")
     suspend fun getMultiDetail(
         @Query("wd") wd: String = "",
-        @Query("keys") keys: String = ""
+        @Query("keys") keys: String = "",
+        @Query("fast") fast: Boolean = false
     ): ApiListResponse<MediaDetail>
+
+    @GET("/api/detail")
+    suspend fun getDetail(
+        @Query("site_key") siteKey: String,
+        @Query("id") id: String
+    ): MediaDetail
 
     // ========== 图片代理 ==========
     @GET("/api/img")

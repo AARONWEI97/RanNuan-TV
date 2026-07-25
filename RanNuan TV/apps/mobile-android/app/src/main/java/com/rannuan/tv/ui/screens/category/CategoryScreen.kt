@@ -1,5 +1,6 @@
 package com.rannuan.tv.ui.screens.category
 
+import android.content.Context
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
@@ -18,6 +19,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.material3.*
+import androidx.compose.ui.platform.LocalContext
+import com.google.gson.Gson
 import com.rannuan.tv.data.api.CategoryRequest
 import com.rannuan.tv.data.api.RanNuanApi
 import com.rannuan.tv.data.model.CategoryResponse
@@ -32,17 +35,60 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.supervisorScope
 
 private const val CATEGORY_PAGE_SIZE = 20
 private const val CATEGORY_CACHE_MAX_PAGES = 24
 private const val CATEGORY_CACHE_TTL_MS = 5 * 60 * 1000L
+private const val CATEGORY_DISK_CACHE_TTL_MS = 24 * 60 * 60 * 1000L
 private const val CATEGORY_LOAD_MORE_THRESHOLD = 12
 
 private data class CategoryRestore(
     val items: List<MediaItem>,
     val lastResponse: CategoryResponse?
 )
+
+private fun categoryIdentity(item: MediaItem): String {
+    val title = item.vodName.ifBlank { item.title }
+        .lowercase()
+        .replace(Regex("[·・:：\\s\\-—_…!！?？,，.。/\\\\\\[\\]【】（）()\"'“”‘’]"), "")
+    return if (title.isNotBlank()) "$title|${item.vodYear.orEmpty()}" else "${item.siteKey}:${item.vodId}"
+}
+
+private fun dedupeCategoryItems(items: List<MediaItem>): List<MediaItem> =
+    items.distinctBy(::categoryIdentity)
+
+private object CategoryDiskCache {
+    private const val PREFS_NAME = "rannuan_category_first_pages_v4"
+    private val gson = Gson()
+
+    private data class Entry(
+        val savedAt: Long = 0L,
+        val response: CategoryResponse = CategoryResponse()
+    )
+
+    private fun key(category: String, subType: String?) = "$category|${subType.orEmpty()}"
+
+    fun get(context: Context, category: String, subType: String?): CategoryResponse? {
+        val raw = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(key(category, subType), null) ?: return null
+        val entry = runCatching { gson.fromJson(raw, Entry::class.java) }.getOrNull() ?: return null
+        if (!entry.response.complete || entry.response.list.isEmpty() ||
+            System.currentTimeMillis() - entry.savedAt > CATEGORY_DISK_CACHE_TTL_MS
+        ) {
+            return null
+        }
+        return entry.response
+    }
+
+    fun put(context: Context, category: String, subType: String?, response: CategoryResponse) {
+        if (response.list.isEmpty()) return
+        val entry = Entry(System.currentTimeMillis(), response)
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(key(category, subType), gson.toJson(entry))
+            .apply()
+    }
+}
 
 private object CategoryPageCache {
     private data class Entry(val response: CategoryResponse, val savedAt: Long)
@@ -63,7 +109,8 @@ private object CategoryPageCache {
     fun get(category: String, subType: String?, page: Int, pageSize: Int = CATEGORY_PAGE_SIZE): CategoryResponse? {
         val cacheKey = key(category, subType, page, pageSize)
         val entry = pages[cacheKey] ?: return null
-        if (System.currentTimeMillis() - entry.savedAt > CATEGORY_CACHE_TTL_MS) {
+        val ttl = if (entry.response.complete) CATEGORY_CACHE_TTL_MS else 2_500L
+        if (System.currentTimeMillis() - entry.savedAt > ttl) {
             pages.remove(cacheKey)
             return null
         }
@@ -73,11 +120,6 @@ private object CategoryPageCache {
     @Synchronized
     fun put(category: String, subType: String?, page: Int, response: CategoryResponse, pageSize: Int = CATEGORY_PAGE_SIZE) {
         pages[key(category, subType, page, pageSize)] = Entry(response, System.currentTimeMillis())
-    }
-
-    @Synchronized
-    fun has(category: String, subType: String?, page: Int, pageSize: Int = CATEGORY_PAGE_SIZE): Boolean {
-        return get(category, subType, page, pageSize) != null
     }
 
     suspend fun getOrFetch(
@@ -122,23 +164,7 @@ private object CategoryPageCache {
             items += response.list
             lastResponse = response
         }
-        return CategoryRestore(items, lastResponse)
-    }
-}
-
-suspend fun prefetchCategoryFirstPages(api: RanNuanApi) {
-    val targets = listOf("movie", "tv", "variety", "anime")
-    delay(500)
-    supervisorScope {
-        targets.forEach { category ->
-            launch {
-                if (!CategoryPageCache.has(category, null, 1)) {
-                    runCatching {
-                        CategoryPageCache.getOrFetch(api, category, null, 1)
-                    }
-                }
-            }
-        }
+        return CategoryRestore(dedupeCategoryItems(items), lastResponse)
     }
 }
 
@@ -159,6 +185,7 @@ val SUB_CATEGORIES = mapOf(
 
 @Composable
 fun CategoryScreen(type: String, api: RanNuanApi, onNavigate: (String) -> Unit) {
+    val context = LocalContext.current
     var currentType by rememberSaveable { mutableStateOf(type) }
     val label = CATEGORY_NAMES[currentType] ?: currentType
     var data by remember { mutableStateOf<CategoryResponse?>(null) }
@@ -166,23 +193,34 @@ fun CategoryScreen(type: String, api: RanNuanApi, onNavigate: (String) -> Unit) 
     var error by remember { mutableStateOf<String?>(null) }
     var page by rememberSaveable { mutableStateOf(1) }
     var loadingMore by remember { mutableStateOf(false) }
+    var loadMoreError by remember { mutableStateOf<String?>(null) }
+    var retryKey by rememberSaveable { mutableIntStateOf(0) }
     var allItems by remember(currentType) { mutableStateOf<List<MediaItem>>(emptyList()) }
     // 当前选中的子分类标签（null = 全部）
     var activeSub by rememberSaveable { mutableStateOf<String?>(null) }
+    var firstPageComplete by remember(currentType, activeSub) { mutableStateOf(false) }
     val subList = SUB_CATEGORIES[currentType] ?: emptyList()
     val gridState = rememberLazyGridState()
+    val screenScope = rememberCoroutineScope()
+    val latestPage by rememberUpdatedState(page)
 
     fun restoreCachedFirstPage(subType: String?) {
         val cached = CategoryPageCache.restore(currentType, subType, 1)
-        data = cached.lastResponse
-        allItems = cached.items
-        loading = cached.items.isEmpty()
+        val disk = if (cached.items.isEmpty()) CategoryDiskCache.get(context, currentType, subType) else null
+        data = cached.lastResponse ?: disk
+        allItems = dedupeCategoryItems(cached.items.ifEmpty { disk?.list.orEmpty() })
+        firstPageComplete = (cached.lastResponse ?: disk)?.complete == true
+        loading = allItems.isEmpty()
         loadingMore = false
+        loadMoreError = null
         error = null
     }
 
     fun hasMorePages(): Boolean {
         val currentData = data ?: return allItems.isNotEmpty()
+        if (!currentData.complete || currentData.warming) {
+            return !currentData.outOfRange && currentData.list.isNotEmpty()
+        }
         val totalPages = currentData.totalPages
         val currentPageHadItems = currentData.list.isNotEmpty()
         return !currentData.outOfRange &&
@@ -194,13 +232,14 @@ fun CategoryScreen(type: String, api: RanNuanApi, onNavigate: (String) -> Unit) 
         activeSub = null
         page = 1
         restoreCachedFirstPage(null)
+        gridState.scrollToItem(0)
         if (currentType != type) {
             onNavigate("category/$currentType")
         }
     }
 
     // 加载分类数据
-    LaunchedEffect(currentType, page, activeSub) {
+    LaunchedEffect(currentType, page, activeSub, retryKey) {
         val cached = CategoryPageCache.get(currentType, activeSub, page)
         if (cached != null) {
             val restored = CategoryPageCache.restore(currentType, activeSub, page)
@@ -208,6 +247,7 @@ fun CategoryScreen(type: String, api: RanNuanApi, onNavigate: (String) -> Unit) 
             data = restored.lastResponse ?: cached
             loading = false
             loadingMore = false
+            loadMoreError = null
             error = null
             return@LaunchedEffect
         }
@@ -216,16 +256,64 @@ fun CategoryScreen(type: String, api: RanNuanApi, onNavigate: (String) -> Unit) 
             val resp = CategoryPageCache.getOrFetch(api, currentType, activeSub, page)
             if (page == 1) {
                 data = resp
-                allItems = resp.list
+                allItems = dedupeCategoryItems(resp.list)
+                firstPageComplete = resp.complete
+                if (resp.complete) CategoryDiskCache.put(context, currentType, activeSub, resp)
             } else {
-                allItems = allItems + resp.list
+                allItems = dedupeCategoryItems(allItems + resp.list)
             }
             data = resp
             loading = false
             loadingMore = false
+            loadMoreError = null
         } catch (e: Exception) {
             if (page == 1) { error = e.message; loading = false }
+            else loadMoreError = e.message ?: "加载下一页失败"
             loadingMore = false
+        }
+    }
+
+    // 始终提前缓存下一页，隐藏公网多站聚合的等待时间。
+    LaunchedEffect(currentType, activeSub, page, allItems.isNotEmpty(), data?.totalPages, data?.outOfRange) {
+        if (allItems.isEmpty() || data?.outOfRange == true) return@LaunchedEffect
+        val currentData = data
+        if (currentData?.complete == true && page >= currentData.totalPages) return@LaunchedEffect
+        delay(300L)
+        runCatching {
+            CategoryPageCache.getOrFetch(
+                api = api,
+                category = currentType,
+                subType = activeSub,
+                page = page + 1
+            )
+        }
+    }
+
+    // 快速第一页只包含限时内响应的站点。页面先展示，再轮询服务端完整缓存，
+    // 避免临时结果长期只保留一两个资源站。
+    LaunchedEffect(currentType, activeSub, firstPageComplete, allItems.isNotEmpty()) {
+        if (firstPageComplete || allItems.isEmpty()) return@LaunchedEffect
+        repeat(4) {
+            delay(2_500L)
+            val refreshed = runCatching {
+                api.getCategory(
+                    CategoryRequest(
+                        category = currentType,
+                        page = 1,
+                        pageSize = CATEGORY_PAGE_SIZE,
+                        subType = activeSub
+                    )
+                )
+            }.getOrNull() ?: return@repeat
+            if (refreshed.list.isNotEmpty()) {
+                CategoryPageCache.put(currentType, activeSub, 1, refreshed)
+                val restored = CategoryPageCache.restore(currentType, activeSub, latestPage)
+                if (restored.items.isNotEmpty()) allItems = restored.items
+                if (latestPage == 1) data = refreshed
+                if (refreshed.complete) CategoryDiskCache.put(context, currentType, activeSub, refreshed)
+            }
+            firstPageComplete = refreshed.complete
+            if (refreshed.complete) return@LaunchedEffect
         }
     }
 
@@ -277,6 +365,7 @@ fun CategoryScreen(type: String, api: RanNuanApi, onNavigate: (String) -> Unit) 
                                 activeSub = null
                                 page = 1
                                 restoreCachedFirstPage(null)
+                                screenScope.launch { gridState.scrollToItem(0) }
                             }
                         },
                         label = { Text("全部", fontSize = 12.sp, fontWeight = if (activeSub == null) FontWeight.SemiBold else FontWeight.Normal) },
@@ -298,6 +387,7 @@ fun CategoryScreen(type: String, api: RanNuanApi, onNavigate: (String) -> Unit) 
                                 activeSub = sub
                                 page = 1
                                 restoreCachedFirstPage(sub)
+                                screenScope.launch { gridState.scrollToItem(0) }
                             }
                         },
                         label = {
@@ -343,7 +433,7 @@ fun CategoryScreen(type: String, api: RanNuanApi, onNavigate: (String) -> Unit) 
                     Spacer(Modifier.height(12.dp))
                     Text(error ?: "加载失败", color = Zinc400, fontSize = 14.sp)
                     Spacer(Modifier.height(12.dp))
-                    TextButton(onClick = { page = 1; loading = true; error = null }) {
+                    TextButton(onClick = { page = 1; loading = true; error = null; retryKey++ }) {
                         Text("重试", color = Brand400)
                     }
                 }
@@ -385,7 +475,7 @@ fun CategoryScreen(type: String, api: RanNuanApi, onNavigate: (String) -> Unit) 
 
             // 触发翻页
             LaunchedEffect(shouldLoadMore, loadingMore, page, allItems.size, data?.totalPages, data?.outOfRange, activeSub) {
-                if (shouldLoadMore && !loadingMore && hasMorePages() && allItems.isNotEmpty()) {
+                if (shouldLoadMore && !loadingMore && loadMoreError == null && hasMorePages() && allItems.isNotEmpty()) {
                     loadingMore = true
                     page++
                 }
@@ -414,14 +504,14 @@ fun CategoryScreen(type: String, api: RanNuanApi, onNavigate: (String) -> Unit) 
                         val title = it.title.ifBlank { it.vodName }.trim()
                         val encodedTitle = java.net.URLEncoder.encode(title, "UTF-8")
                         val route = when {
-                            it.siteKey.isNotBlank() && it.vodId.isNotBlank() -> {
-                                putDetailPreview(it, title, "${it.siteKey}:${it.vodId}")
-                                "detail/${it.siteKey}/${it.vodId}?name=$encodedTitle"
-                            }
                             !item.sites.isNullOrEmpty() -> {
                                 val keys = item.sites.joinToString(",") { "${it.key}:${it.id}" }
                                 putDetailPreview(it, title, keys)
                                 "detail/source/$encodedTitle?keys=$keys"
+                            }
+                            it.siteKey.isNotBlank() && it.vodId.isNotBlank() -> {
+                                putDetailPreview(it, title, "${it.siteKey}:${it.vodId}")
+                                "detail/${it.siteKey}/${it.vodId}?name=$encodedTitle"
                             }
                             else -> {
                                 putDetailPreview(it, title, "")
@@ -435,6 +525,18 @@ fun CategoryScreen(type: String, api: RanNuanApi, onNavigate: (String) -> Unit) 
                     item(span = { GridItemSpan(maxLineSpan) }) {
                         Box(Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
                             CircularProgressIndicator(modifier = Modifier.size(24.dp), color = Brand400, strokeWidth = 2.dp)
+                        }
+                    }
+                } else if (loadMoreError != null) {
+                    item(span = { GridItemSpan(maxLineSpan) }) {
+                        Box(Modifier.fillMaxWidth().padding(12.dp), contentAlignment = Alignment.Center) {
+                            TextButton(onClick = {
+                                loadMoreError = null
+                                loadingMore = true
+                                retryKey++
+                            }) {
+                                Text("加载失败，点击重试", color = Brand400)
+                            }
                         }
                     }
                 }

@@ -21,10 +21,29 @@ export default function HomePage() {
   const homeResolvedTargets = useRef<Map<string, MediaItem[]>>(new Map());
 
   useEffect(() => {
-    getDoubanHome()
-      .then(setDoubanData)
-      .catch(() => {})
-      .finally(() => setLoading(false));
+    let cancelled = false;
+    const retryDelays = [0, 300, 500, 800, 1200, 1500];
+
+    const loadHome = async () => {
+      for (const delayMs of retryDelays) {
+        if (cancelled) return;
+        if (delayMs > 0) {
+          await new Promise(resolve => window.setTimeout(resolve, delayMs));
+        }
+        try {
+          const data = await getDoubanHome();
+          if (!cancelled) setDoubanData(data);
+          return;
+        } catch {
+          // The packaged backend starts in parallel with the WebView. Retry briefly.
+        }
+      }
+    };
+
+    void loadHome().finally(() => {
+      if (!cancelled) setLoading(false);
+    });
+    return () => { cancelled = true; };
   }, []);
 
   const resolveHomeTarget = useCallback((title: string) => {

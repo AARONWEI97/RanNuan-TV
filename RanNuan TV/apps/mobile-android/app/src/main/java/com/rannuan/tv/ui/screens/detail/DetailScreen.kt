@@ -53,8 +53,11 @@ import com.rannuan.tv.ui.util.ImageProxy
 import com.rannuan.tv.ui.util.formatSourceName
 import com.rannuan.tv.ui.util.stripHtml
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withContext
 
 private const val DETAIL_CACHE_MAX_ITEMS = 32
@@ -152,6 +155,32 @@ fun putDetailPreview(item: MediaItem, title: String, keys: String) {
     )
 }
 
+private data class DetailAddress(val siteKey: String, val vodId: String)
+
+private fun parseDetailAddresses(keys: String): List<DetailAddress> = keys
+    .split(',')
+    .mapNotNull { raw ->
+        val parts = raw.trim().split(':', limit = 2)
+        if (parts.size == 2 && parts[0].isNotBlank() && parts[1].isNotBlank()) {
+            DetailAddress(parts[0], parts[1])
+        } else {
+            null
+        }
+    }
+    .distinct()
+
+private fun primaryFirst(
+    list: List<MediaDetail>,
+    primary: MediaDetail?,
+    expectedTitle: String,
+    keys: String
+): List<MediaDetail> {
+    val ranked = rankDetailResults(list, expectedTitle, keys)
+    val primaryKey = primary?.let { "${it.siteKey}:${it.vodId}" }
+    if (primaryKey.isNullOrBlank()) return ranked
+    return ranked.sortedBy { if ("${it.siteKey}:${it.vodId}" == primaryKey) 0 else 1 }
+}
+
 suspend fun warmDetailCache(api: RanNuanApi, wd: String, keys: String) {
     val cacheKey = keys.trim()
     val query = wd.trim()
@@ -200,33 +229,111 @@ fun DetailScreen(
     }
     val contentVisible = remember { androidx.compose.animation.core.MutableTransitionState(false) }
 
-    // 加载数据
+    // 主线路先出首屏，其他站点随后在同一页面补齐。
     LaunchedEffect(wd, realKeys) {
+        val addresses = parseDetailAddresses(realKeys)
         val cached = DetailMemoryCache.get(wd, realKeys)
-        if (cached != null) {
-            details = cached
-            loading = false
-            error = null
-            return@LaunchedEffect
-        }
-
-        val warmCandidates = listOfNotNull(
+        val warmed = listOfNotNull(
             DetailWarmCache.get(wd, realKeys),
             DetailWarmCache.get(wd, "")
-        )
-        warmCandidates.firstOrNull { it.isNotEmpty() }?.let { warmed ->
-            details = warmed
-            loading = false
+        ).firstOrNull { it.isNotEmpty() }
+        val seeded = cached ?: warmed
+        seeded?.let {
+            details = it
+            loading = it.none { detail -> !detail.vodPlayUrl.isNullOrBlank() }
             error = null
-            return@LaunchedEffect
         }
 
-        loading = true
+        val hasPlayableSeed = seeded?.any { !it.vodPlayUrl.isNullOrBlank() } == true
+        loading = !hasPlayableSeed
         error = null
+        val primaryAddress = when {
+            siteKey.isNotBlank() && id.isNotBlank() -> DetailAddress(siteKey, id)
+            else -> addresses.firstOrNull()
+        }
+        var primary: MediaDetail? = seeded?.firstOrNull()
+
+        fun publish(resolved: List<MediaDetail>) {
+            val realResolved = resolved.filter { it.siteKey.isNotBlank() && it.vodId.isNotBlank() }
+            if (realResolved.isEmpty()) return
+            val activeKey = details.getOrNull(activeIdx)?.let { "${it.siteKey}:${it.vodId}" }
+            val completed = primaryFirst(
+                realResolved.distinctBy { "${it.siteKey}:${it.vodId}" },
+                primary,
+                wd,
+                realKeys
+            )
+            if (completed.isEmpty()) return
+            details = completed
+            activeIdx = activeKey
+                ?.let { key -> completed.indexOfFirst { "${it.siteKey}:${it.vodId}" == key } }
+                ?.takeIf { it >= 0 }
+                ?: activeIdx.coerceIn(0, completed.lastIndex)
+            loading = false
+            DetailMemoryCache.put(wd, realKeys, completed)
+            val nameForCache = wd.takeIf { it.isNotBlank() } ?: completed.first().vodName
+            DetailWarmCache.put(nameForCache, realKeys, completed)
+            DetailWarmCache.put(nameForCache, "", completed)
+        }
+
         try {
-            // 1. 优先用 keys 精准拉取（快）
-            val resp = api.getMultiDetail(wd = wd, keys = realKeys)
-            val result = rankDetailResults(resp.list, wd, realKeys).toMutableList()
+            if (wd.isBlank() && addresses.size <= 1 && primaryAddress != null) {
+                if (!hasPlayableSeed) {
+                    primary = runCatching {
+                        api.getDetail(primaryAddress.siteKey, primaryAddress.vodId).let { detail ->
+                            detail.copy(
+                                siteKey = detail.siteKey.ifBlank { primaryAddress.siteKey },
+                                vodId = detail.vodId.ifBlank { primaryAddress.vodId }
+                            )
+                        }
+                    }.getOrNull()
+                    publish(listOfNotNull(primary))
+                }
+                return@LaunchedEffect
+            }
+
+            val result = supervisorScope {
+                val collected = mutableListOf<MediaDetail>()
+                val fullKeys = realKeys.takeIf { addresses.size > 1 }.orEmpty()
+                val fullRequest = async {
+                    var response = runCatching { api.getMultiDetail(wd = wd, keys = fullKeys) }.getOrNull()
+                    collected.addAll(response?.list.orEmpty())
+                    publish(collected + listOfNotNull(primary))
+
+                    // 首次限时响应可能只是部分线路；服务端仍在聚合，稍后补拉缓存结果。
+                    if (response?.complete == false && (wd.isNotBlank() || fullKeys.isNotBlank())) {
+                        delay(1200L)
+                        response = runCatching { api.getMultiDetail(wd = wd, keys = fullKeys) }.getOrNull()
+                        collected.addAll(response?.list.orEmpty())
+                        publish(collected + listOfNotNull(primary))
+                    }
+                }
+                val primaryRequest = if (!hasPlayableSeed) async {
+                    val first = runCatching {
+                        if (primaryAddress != null) {
+                            api.getDetail(primaryAddress.siteKey, primaryAddress.vodId).let { detail ->
+                                detail.copy(
+                                    siteKey = detail.siteKey.ifBlank { primaryAddress.siteKey },
+                                    vodId = detail.vodId.ifBlank { primaryAddress.vodId }
+                                )
+                            }
+                        } else {
+                            api.getMultiDetail(wd = wd, fast = true).list.firstOrNull()
+                        }
+                    }.getOrNull()
+                    if (first != null) {
+                        primary = first
+                        collected.add(first)
+                        publish(collected)
+                    }
+                    first
+                } else null
+
+                primaryRequest?.await()
+                fullRequest.await()
+                collected
+            }
+
             if (result.isEmpty() && wd.isNotBlank() && realKeys.isNotBlank()) {
                 val fallbackResp = api.getMultiDetail(wd = wd, keys = "")
                 result.addAll(rankDetailResults(fallbackResp.list, wd, ""))
@@ -239,19 +346,12 @@ fun DetailScreen(
                 }
             }
 
-            if (result.isNotEmpty()) {
-                details = result
-                DetailMemoryCache.put(wd, realKeys, result)
-                val nameForCache = wd.takeIf { it.isNotBlank() } ?: result.firstOrNull()?.vodName.orEmpty()
-                if (nameForCache.isNotBlank()) {
-                    DetailWarmCache.put(nameForCache, realKeys, result)
-                    DetailWarmCache.put(nameForCache, "", result)
-                }
-            } else if (details.isEmpty()) {
+            publish(result + listOfNotNull(primary))
+            if (details.isEmpty()) {
                 error = "未找到影片详情"
             }
         } catch (e: Exception) {
-            error = e.message
+            if (details.isEmpty()) error = e.message
         } finally {
             loading = false
         }
@@ -788,6 +888,5 @@ private fun JsonObject.readMediaItems(gson: Gson, itemListType: java.lang.reflec
 private fun normalizeDetailTitle(value: String?): String =
     value.orEmpty()
         .lowercase()
-        .replace(Regex("第[一二三四五六七八九十0-9]+季"), "")
         .replace(Regex("[\\s:：·.。!！?？\\-_/\\\\（）()【】\\[\\]]+"), "")
         .trim()

@@ -1,8 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::time::Duration;
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -42,17 +45,45 @@ fn strip_verbatim(path: &std::path::Path) -> PathBuf {
     PathBuf::from(stripped)
 }
 
+fn open_backend_log(app: &tauri::AppHandle) -> Option<(PathBuf, File)> {
+    let log_dir = app.path().app_log_dir().ok()?;
+    fs::create_dir_all(&log_dir).ok()?;
+    let log_path = log_dir.join("backend.log");
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .ok()?;
+    Some((log_path, file))
+}
+
+fn append_backend_log(app: &tauri::AppHandle, message: &str) {
+    if let Some((_, mut file)) = open_backend_log(app) {
+        let _ = writeln!(file, "{}", message);
+    }
+}
+
+fn find_node_executable(server_dir: &Path) -> PathBuf {
+    let runtime_name = if cfg!(target_os = "windows") {
+        "node.exe"
+    } else {
+        "node"
+    };
+    let bundled = server_dir.join("node-runtime").join(runtime_name);
+    if bundled.exists() {
+        return strip_verbatim(&bundled);
+    }
+    PathBuf::from("node")
+}
+
 fn find_server_js(app: &tauri::App) -> Option<PathBuf> {
     // 1. Tauri 资源目录（生产打包）
-    let resource_server = app
-        .path()
-        .resource_dir()
-        .ok()?
-        .join("server")
-        .join("server.js");
-    if resource_server.exists() {
-        println!("[Tauri] 生产路径: {:?}", resource_server);
-        return Some(resource_server);
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        let resource_server = resource_dir.join("server").join("server.js");
+        if resource_server.exists() {
+            println!("[Tauri] 生产路径: {:?}", resource_server);
+            return Some(resource_server);
+        }
     }
     // 2. 开发路径（CARGO_MANIFEST_DIR 相对）
     let dev_server = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../server/server.js");
@@ -130,28 +161,78 @@ fn main() {
                 .build(app)?;
 
             // ====== 启动后端 ======
+            let app_handle = app.handle().clone();
+            let mut backend_pid = None;
             if let Some(server_js) = find_server_js(app) {
                 let server_js = strip_verbatim(&server_js);
                 let server_dir = strip_verbatim(server_js.parent().unwrap());
-                println!("[Tauri] 启动后端: {:?}", server_js);
+                let node_executable = find_node_executable(&server_dir);
+                let startup_message = format!(
+                    "[Tauri] Starting backend: node={:?}, script={:?}",
+                    node_executable, server_js
+                );
+                println!("{}", startup_message);
+                append_backend_log(&app_handle, &startup_message);
 
-                let mut cmd = Command::new("node");
+                let mut cmd = Command::new(&node_executable);
                 cmd.arg(&server_js)
-                    .current_dir(&server_dir)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null());
+                    .current_dir(&server_dir);
+                let log_path = if let Some((path, stdout)) = open_backend_log(&app_handle) {
+                    match stdout.try_clone() {
+                        Ok(stderr) => {
+                            cmd.stdout(Stdio::from(stdout)).stderr(Stdio::from(stderr));
+                        }
+                        Err(_) => {
+                            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+                        }
+                    }
+                    Some(path)
+                } else {
+                    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+                    None
+                };
                 #[cfg(target_os = "windows")]
                 cmd.creation_flags(CREATE_NO_WINDOW);
 
                 match cmd.spawn() {
-                    Ok(child) => {
+                    Ok(mut child) => {
                         let pid = child.id();
-                        println!("[Tauri] 后端 PID: {} 已启动", pid);
-                        app.manage(ServerPid(Mutex::new(Some(pid))));
+                        std::thread::sleep(Duration::from_millis(400));
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                let message = format!(
+                                    "[Tauri] Backend exited during startup: {}. Log: {:?}",
+                                    status, log_path
+                                );
+                                eprintln!("{}", message);
+                                append_backend_log(&app_handle, &message);
+                            }
+                            Ok(None) => {
+                                let message = format!("[Tauri] Backend PID {} is running", pid);
+                                println!("{}", message);
+                                append_backend_log(&app_handle, &message);
+                                backend_pid = Some(pid);
+                            }
+                            Err(error) => {
+                                let message = format!("[Tauri] Failed to inspect backend: {}", error);
+                                eprintln!("{}", message);
+                                append_backend_log(&app_handle, &message);
+                            }
+                        }
                     }
-                    Err(e) => eprintln!("[Tauri] 后端启动失败: {}", e),
+                    Err(error) => {
+                        let message = format!(
+                            "[Tauri] Backend spawn failed: {}. node={:?}",
+                            error, node_executable
+                        );
+                        eprintln!("{}", message);
+                        append_backend_log(&app_handle, &message);
+                    }
                 }
+            } else {
+                append_backend_log(&app_handle, "[Tauri] server.js was not found");
             }
+            app.manage(ServerPid(Mutex::new(backend_pid)));
             Ok(())
         })
         .on_window_event(|window, event| {

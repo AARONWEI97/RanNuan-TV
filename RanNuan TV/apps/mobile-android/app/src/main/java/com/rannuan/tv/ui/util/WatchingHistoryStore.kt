@@ -19,7 +19,9 @@ object WatchingHistoryStore {
         val cover: String,
         val episode: String,
         val timestamp: Long,
-        val position: Long = 0L   // 播放位置（毫秒），用于续播
+        val position: Long = 0L,
+        val sourceIndex: Int = -1,
+        val episodeIndex: Int = -1
     )
 
     private fun prefs(ctx: Context): SharedPreferences =
@@ -38,7 +40,9 @@ object WatchingHistoryStore {
                     cover = obj.optString("cover"),
                     episode = obj.optString("episode"),
                     timestamp = obj.optLong("timestamp"),
-                    position = obj.optLong("position")
+                    position = obj.optLong("position"),
+                    sourceIndex = obj.optInt("sourceIndex", -1),
+                    episodeIndex = obj.optInt("episodeIndex", -1)
                 )
             }
         } catch (_: Exception) { emptyList() }
@@ -48,11 +52,28 @@ object WatchingHistoryStore {
         ctx: Context,
         siteKey: String, id: String,
         title: String, cover: String, episode: String,
-        position: Long = 0L
+        position: Long = 0L,
+        sourceIndex: Int = 0,
+        episodeIndex: Int = 0,
+        preserveExistingPosition: Boolean = false
     ) {
         val list = getHistory(ctx).toMutableList()
+        val existing = list.firstOrNull { it.siteKey == siteKey && it.id == id }
         list.removeAll { it.siteKey == siteKey && it.id == id }
-        list.add(0, HistoryItem(siteKey, id, title, cover, episode, System.currentTimeMillis(), position))
+        val savedPosition = if (
+            preserveExistingPosition && existing?.sourceIndex == sourceIndex && existing.episodeIndex == episodeIndex
+        ) {
+            maxOf(position, existing.position)
+        } else {
+            position
+        }
+        list.add(
+            0,
+            HistoryItem(
+                siteKey, id, title, cover, episode, System.currentTimeMillis(), savedPosition,
+                sourceIndex, episodeIndex
+            )
+        )
         val trimmed = list.take(50)
         val json = JSONArray(trimmed.map { item ->
             JSONObject().apply {
@@ -63,6 +84,8 @@ object WatchingHistoryStore {
                 put("episode", item.episode)
                 put("timestamp", item.timestamp)
                 put("position", item.position)
+                put("sourceIndex", item.sourceIndex)
+                put("episodeIndex", item.episodeIndex)
             }
         }).toString()
         prefs(ctx).edit().putString(KEY_HISTORY, json).apply()
@@ -88,6 +111,8 @@ object WatchingHistoryStore {
                 put("episode", item.episode)
                 put("timestamp", item.timestamp)
                 put("position", item.position)
+                put("sourceIndex", item.sourceIndex)
+                put("episodeIndex", item.episodeIndex)
             }
         }).toString()
         prefs(ctx).edit().putString(KEY_HISTORY, json).apply()

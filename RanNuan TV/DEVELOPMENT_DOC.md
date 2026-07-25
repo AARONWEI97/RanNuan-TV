@@ -345,12 +345,22 @@ isLikelyActor(wd)：中文 2~6 字 / 英文全名，排除分类关键词
 | 模块 | 桌面端 | Android 移动端 |
 |------|--------|----------------|
 | 分类列表 | 可预取相邻页，依赖内存缓存提升翻页 | 改为按需分页，优先 Paging 3/ViewModel 分页状态机；禁止全局批量预热抢当前请求 |
-| 首页推荐 | 可后台预解析部分 Banner/推荐 | 首页只展示元数据；点击时按 `siteKey:vodId` 或 `keys` 精准拉详情 |
-| 详情匹配 | 多源 `keys` 直拉，名称搜索兜底 | Identity-first：`siteKey + vodId` 优先，标题/导演/年份只做校验与排序 |
+| 首页推荐 | 可后台预解析部分 Banner/推荐 | 首页只展示元数据；无资源站 ID 时先返回最快可用线路，其他线路后台补齐 |
+| 详情匹配 | 多源 `keys` 直拉，名称搜索兜底 | Identity-first：先用 `/api/detail` 精确拉主线路并开放播放，再异步补齐多源 |
 | 播放链路 | hls.js/flv.js 与浏览器缓存处理拉流 | Media3 ExoPlayer 独立 LoadControl；播放拉流不与分类/详情预热抢资源 |
 | 缓冲提示 | 可依赖 HTML5 player 事件 | Android 仅在 `!isPlaying` 且缓冲持续超过阈值时展示，不在流畅播放中弹层 |
 
 > 结论：移动端不能继续通过“更多预热”解决卡顿，必须减少后台并发、按需加载、精准匹配、播放器链路隔离。
+
+Android 详情首屏采用渐进式链路：
+
+```text
+卡片预览立即渲染
+  → 已知 siteKey:vodId：/api/detail 精确拉主线路
+  → 只有片名：/api/multi-detail?fast=true 返回最快有效线路
+  → 主线路可播放后，后台复用同一批服务端任务补齐其他站点
+  → 详情缓存 30 分钟，多源聚合缓存 10 分钟
+```
 
 ### 7.3 跨站点合并去重
 
@@ -387,6 +397,16 @@ isLikelyActor(wd)：中文 2~6 字 / 英文全名，排除分类关键词
 - **断点静默续播**：历史记录点击直通播放器，自动 seek 到上次位置
 - **选集条件显示**：仅多集剧集或多源时显示选集区块
 - **相关推荐**：分类 API + 演员兜底，2列横向网格 + loading/空态/重试
+
+**Android 播放器控制层（v3.6）**：
+
+- 竖屏视频内只保留播放、时间、品牌 Logo 进度拖点和全屏，换源、选集、投屏、收藏、分享放在视频下方独立操作区。
+- 横屏底部采用进度行与操作行分层，倍速、播放源、选集使用短文字入口；锁定按钮固定在左侧中部。
+- 横屏设置和播放源均使用右侧抽屉，竖屏播放源使用底部面板，减少对画面的遮挡。
+- 双击任意播放区域只切换播放/暂停；左侧长按快退、右侧长按快进，跳转秒数沿用播放器设置。
+- 新增统一换源面板，跨站点与站内线路在同一列表展示，切线时优先保持当前集数。
+- 播放页先通过 `/api/detail` 精确获取当前线路并开始播放，多源列表随后异步补齐。
+- 直连和代理均失败时可自动尝试下一条线路；倍速、跳转秒数、画面模式、播放方式、镜像和自动换源偏好保存到本机。
 
 ### 7.5 图片处理规则
 
@@ -482,7 +502,7 @@ pnpm tauri build
 RanNuan TV.exe 启动
   → SplashScreen: 影院启动动画（3s，放映机光束+Logo+音效）
   → Rust 壳: 自定义标题栏 + 系统托盘
-  → setup() 自动 spawn: node.exe server.js (CREATE_NO_WINDOW 无黑窗口, 监听 :3000)
+  → setup() 自动 spawn: 内置 node-runtime/node.exe server.js (CREATE_NO_WINDOW 无黑窗口, 监听 :3000)
   → WebView 加载前端 (dist/)
   → 前端通过 localhost:3000 访问后端 API
   → 点 × → 隐藏到托盘（不退出）
@@ -509,6 +529,7 @@ RanNuan TV.exe 启动
 |------|------|
 | `tauri.conf.json` | 窗口配置、`decorations: false`隐藏默认标题栏、trayIcon、resources 打包 server/ |
 | `src/main.rs` | 托盘菜单、自动启动后端(CREATE_NO_WINDOW隐藏CMD)、关闭→隐藏、PID杀进程 |
+| `prepare-backend.cjs` | 打包前复制 Node 运行时，并用 npm 将 server 依赖转为可打包的真实目录 |
 | `capabilities/default.json` | 窗口操作/Shell 权限 |
 | `Cargo.toml` | Rust 依赖（tauri + tray-icon + shell-plugin） |
 
@@ -531,34 +552,26 @@ RanNuan TV.exe 启动
 | 11 | `capabilities/default.json` | ✅ | 窗口操作/Shell 权限 |
 | 12 | `src/main.rs` | ✅ | 托盘+后端启动(CREATE_NO_WINDOW)+关闭隐藏 |
 | 13 | `Cargo.toml` | ✅ | Rust 依赖 |
-| 14 | 系统 Node.js | ⚠️ | 生产环境需安装 Node.js（应用不内置） |
+| 14 | 内置 Node.js | ✅ | 构建时复制到 `server/node-runtime/`，用户无需安装 Node |
 | 15 | 无其他进程占用 target/ | ⚠️ | dev 环境必须先关闭，否则 os error 32 文件锁定 |
 
-> **注意**：第 14 项 — 因 `pkg` 二进制仓库故障，`node.exe` 未打包进应用。后端由 `main.rs` 通过 `Command::new("node")` 启动，要求用户系统安装了 Node.js 且 `node` 命令在 PATH 中。
+> **注意**：生产包必须包含 `server/node-runtime/node.exe`。`main.rs` 优先使用内置运行时，仅在开发环境或旧目录结构下回退系统 `node`；后端输出写入 Tauri 应用日志目录的 `backend.log`。
 
 #### ⚠️ pnpm 符号链接 vs NSIS 打包（重要）
 
 **问题**：pnpm 安装的 `server/node_modules` 使用 Windows 符号链接（`SYMLINKD`），所有包指向上层 `../../node_modules/.pnpm/...`。NSIS 的 `File /r` 指令**不会解析 Windows 符号链接**，导致 `node_modules` 目录打不进安装包 → makensis 编译失败或安装包缺失依赖。
 
-**解决方案**：打包前必须用 npm 在 `server/` 目录独立安装一份真实依赖：
+**解决方案**：`pnpm tauri build` 会通过 `beforeBuildCommand` 自动运行 `src-tauri/prepare-backend.cjs`。脚本检测到符号链接后执行 `npm ci --omit=dev`，再复制当前 Node 运行时。也可以单独验证：
 
 ```bash
-# 1. 删除 pnpm 的符号链接 node_modules
-cd "RanNuan TV/server"
-rmdir /s /q node_modules
+# 在 apps/desktop 下运行
+node src-tauri/prepare-backend.cjs
 
-# 2. 用 npm 安装真实文件（非符号链接）
-npm install --production
-
-# 3. 验证无符号链接
-dir node_modules | findstr /i "SYMLINK" && echo "FAIL!" || echo "OK"
-
-# 4. 打包
-cd ../apps/desktop
+# 随后正常打包
 pnpm tauri build
 ```
 
-> **注意**：每次在项目根目录执行 `pnpm install` 后，`server/node_modules` 会被 pnpm 重新创建为符号链接。**打包前务必重新执行上述步骤**。建议将此步骤加入打包脚本。
+> **注意**：项目根目录执行 `pnpm install` 后，`server/node_modules` 可能重新变为符号链接；打包前置脚本会自动识别并修复。
 
 #### ⚠️ Windows 图标缓存问题
 
@@ -629,8 +642,8 @@ setResults(prev => dedupClientSide([...prev, ...videos]));
 | **跨站合并标题归一化** | 不同CMS源标题格式不同（`南部档案`/`南部档案2026`/`南部档案(2026)`），合并key需去括号+年份+季数，仅保留核心片名 |
 | **SSE搜索结果需客户端实时去重** | `merged`事件要等全量扫描结束才发，搜索过程中用户看到的是未合并原始列表；应在`videos`回调中客户端去做合并去重 |
 | **Tauri NSIS快捷方式图标** | `installerIcon`只控制安装包exe文件图标，桌面/开始菜单快捷方式默认从`ran-nuan-tv.exe`提取；需将`.ico`复制到安装目录并在`CreateShortcut`中显式指定路径 |
-| **pnpm符号链接NSIS不解析** | pnpm的`node_modules`是`SYMLINKD`指向上层`.pnpm`，NSIS的`File /r`不解析Windows符号链接，导致打包失败；打包前必须`npm install --production`安装真实文件 |
-| **pnpm install会重建符号链接** | 每次根目录`pnpm install`后`server/node_modules`会变回符号链接，打包前需重新`npm install --production` |
+| **pnpm符号链接NSIS不解析** | pnpm 的 `node_modules` 指向 `.pnpm`，安装包会缺失 axios/express；桌面打包前置脚本必须自动准备 npm 生产依赖 |
+| **桌面包不能依赖系统Node** | 开发机有全局 Node 会掩盖生产故障；安装包必须包含 `server/node-runtime/node.exe`，Rust 启动器优先执行内置运行时 |
 | **Windows图标缓存坑** | 安装后图标显示不对不一定是配置问题，可能是Windows图标缓存；清`IconCache.db`+`iconcache*`即可 |
 | **dev环境文件锁定** | 打包时dev环境必须先关闭，否则`target/release/`下的exe被占用导致os error 32 |
 | **CREATE_NO_WINDOW隐藏CMD** | Rust spawn node进程时加`CREATE_NO_WINDOW`(0x08000000)标志+`Stdio::null()`，CMD黑窗口不再弹出；此时`WINDOWTITLE`过滤失效，需改用PID杀进程 |
@@ -711,16 +724,38 @@ POST /api/category { category, page: 1, pageSize, subType: undefined }
 
 ### 7.11 Android v3.5 体验收尾
 
-- 分类页：最终采用服务端热缓存 + 客户端有限分页缓存 + 滚动按需加载，不再做客户端静默刷新、后续页主动预取或详情 warm。
+- 分类页：采用服务端热缓存 + 客户端最近首屏磁盘快照 + 滚动按需加载；启动时不再并发预取四个分类，进入页面先展示本地快照再请求新数据。
 - 列表首屏：封面图异步加载，先渲染文本骨架和卡片布局，图片后续补齐。
-- 详情页：入口写入预览缓存，详情页先展示预览内容，再补全多源详情和播放源；完整详情请求期间显示局部加载动画。
+- 详情页：入口写入预览缓存；已知资源 ID 时单源精确请求优先，只有片名时取最快线路，主线路可用后再后台补全多源详情和播放源。
+- 服务端详情：`/api/detail` 与 `/api/multi-detail` 共用单源详情缓存和 in-flight 请求，避免 fast/完整请求重复访问上游资源站。
 - 搜索页：移动端改用 `/api/search-stream`，按归一化片名合并多资源站资源，展示逻辑向桌面端一致。
 - 播放线路：Android 端隐藏直连线路，只展示 m3u8；详情页和播放页仍展示视频源名称。
 - 收藏页：首页底部：收藏快照本地优先显示、后台刷新；首页增加底部留白，避免底部导航遮挡最后一屏卡片。
 
+### 7.12 Android 应用内更新
+
+App 在启动页结束后静默请求 `/dataupdate/latest.json`，通过服务端 `versionCode` 与本地 `BuildConfig.VERSION_CODE` 比较版本。无更新或检查失败时不打断正常启动；发现新版本后显示更新内容、版本号、安装包大小和是否强制更新。
+
+```text
+latest.json
+  → versionCode 大于本地版本
+  → 用户确认下载
+  → App 专属 Download/updates 目录
+  → 可选 SHA-256 校验
+  → 请求 Android“安装未知应用”授权
+  → FileProvider 调起系统安装器
+```
+
+- 版本文件：`server/public/dataupdate/latest.json`
+- 安装包目录：`server/public/dataupdate/apk/`
+- 发布说明：`server/DATAUPDATE_DEPLOY.md`
+- 普通 Android App 不执行静默安装，下载完成后仍由系统安装界面让用户确认。
+- 每次发布必须递增 `versionCode`，并使用与旧版本相同的签名证书，否则 Android 无法覆盖安装。
+- APK 不提交到 Git；Docker 部署时应将 `dataupdate` 目录挂载为持久化存储。
+
 ---
 
 
-> 📅 文档版本：v5.9
-> 📝 最后更新：2026-06-30（Android v3.5 上线前体验收尾、分类客户端预取撤销、详情预览加载动画补齐）
+> 📅 文档版本：v6.4
+> 📝 最后更新：2026-07-24（桌面端内置 Node 后端运行时、真实依赖打包与启动日志）
 > 👤 作者：RanNuan TV 开发团队

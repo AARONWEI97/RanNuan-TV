@@ -433,8 +433,16 @@ private fun HistoryTab(
                         .fillMaxWidth()
                         .padding(vertical = 3.dp)
                         .clickable {
+                            val sourceIndex = item.sourceIndex.coerceAtLeast(0)
+                            val episodeIndex = if (item.episodeIndex >= 0) {
+                                item.episodeIndex
+                            } else {
+                                inferLegacyEpisodeIndex(item.episode)
+                            }
                             val posParam = if (item.position > 0) "&pos=${item.position}" else ""
-                            onNavigate("player/${item.siteKey}/${item.id}?src=0&ep=0$posParam")
+                            onNavigate(
+                                "player/${item.siteKey}/${item.id}?src=$sourceIndex&ep=$episodeIndex$posParam"
+                            )
                         },
                     cornerRadius = 12.dp
                 ) {
@@ -504,6 +512,11 @@ private fun HistoryTab(
             }
         )
     }
+}
+
+private fun inferLegacyEpisodeIndex(label: String): Int {
+    val match = Regex("(?:第\\s*)?(\\d+)\\s*集?").find(label) ?: return 0
+    return (match.groupValues[1].toIntOrNull()?.minus(1) ?: 0).coerceAtLeast(0)
 }
 
 private fun formatTimestamp(ts: Long): String {

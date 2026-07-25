@@ -46,6 +46,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -92,16 +93,50 @@ data class CategoryConfig(
     val icon: ImageVector
 )
 
+private object HomeMemoryCache {
+    private const val TTL_MS = 10 * 60 * 1000L
+
+    private data class Entry(val data: DoubanHomeData, val savedAt: Long)
+
+    @Volatile
+    private var entry: Entry? = null
+
+    fun get(): DoubanHomeData? {
+        val cached = entry ?: return null
+        if (System.currentTimeMillis() - cached.savedAt >= TTL_MS) {
+            entry = null
+            return null
+        }
+        return cached.data
+    }
+
+    fun put(data: DoubanHomeData) {
+        if (data.hasContent()) entry = Entry(data, System.currentTimeMillis())
+    }
+}
+
+private fun DoubanHomeData.hasContent(): Boolean =
+    hot.isNotEmpty() || dianshiju.isNotEmpty() || dianying.isNotEmpty() ||
+        zongyi.isNotEmpty() || dongman.isNotEmpty()
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(api: RanNuanApi, onNavigate: (String) -> Unit) {
-    var data by remember { mutableStateOf<DoubanHomeData?>(null) }
-    var loading by remember { mutableStateOf(true) }
+    val cached = remember { HomeMemoryCache.get() }
+    var data by remember { mutableStateOf(cached) }
+    var loading by remember { mutableStateOf(cached == null) }
     var error by remember { mutableStateOf<String?>(null) }
+    var requestKey by remember { mutableIntStateOf(0) }
 
-    LaunchedEffect(Unit) {
+    LaunchedEffect(requestKey) {
+        if (requestKey == 0 && data != null) return@LaunchedEffect
+        loading = true
+        error = null
         try {
-            data = api.getDoubanHome()
+            val response = api.getDoubanHome()
+            if (!response.hasContent()) error("首页数据暂时不可用，请重试")
+            HomeMemoryCache.put(response)
+            data = response
         } catch (e: Exception) {
             error = e.message
         } finally {
@@ -131,7 +166,13 @@ fun HomeScreen(api: RanNuanApi, onNavigate: (String) -> Unit) {
                         style = MaterialTheme.typography.bodyMedium
                     )
                     Spacer(Modifier.height(12.dp))
-                    TextButton(onClick = { error = null }) {
+                    TextButton(
+                        onClick = {
+                            error = null
+                            loading = true
+                            requestKey += 1
+                        }
+                    ) {
                         Text("重试", color = Brand400)
                     }
                 }

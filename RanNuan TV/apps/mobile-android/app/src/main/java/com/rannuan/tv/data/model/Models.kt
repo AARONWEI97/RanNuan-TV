@@ -48,7 +48,8 @@ data class MediaDetail(
 )
 
 data class ApiListResponse<T>(
-    val list: List<T> = emptyList()
+    val list: List<T> = emptyList(),
+    val complete: Boolean? = null
 )
 
 // 首页（豆瓣）响应
