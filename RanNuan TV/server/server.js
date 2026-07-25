@@ -32,8 +32,10 @@ app.use(express.static(PUBLIC_DIR));
 // ==================== 站点 API 配置 ====================
 // api: CMS API 地址
 // detail: 网站域名（用于爬虫回退，格式参考 MoonTVPlus）
+const LZZY_API_PRIMARY = "https://cj.lziapi.com/api.php/provide/vod";
+const LZZY_API_FALLBACK = "https://cj.lzcaiji.com/api.php/provide/vod";
 const DEFAULT_SITES = [
-    { key: "lzzy",  name: "量子资源", api: "https://cj.lziapi.com/api.php/provide/vod", detail: "https://cj.lziapi.com", active: true },
+    { key: "lzzy",  name: "量子资源", api: LZZY_API_PRIMARY, fallbackApis: [LZZY_API_FALLBACK], detail: "https://cj.lziapi.com", active: true },
     { key: "ffzy",  name: "非凡影视", api: "http://cj.ffzyapi.com/api.php/provide/vod",  detail: "http://cj.ffzyapi.com",  active: true },
     { key: "bfzy",  name: "暴风资源", api: "https://bfzyapi.com/api.php/provide/vod",     detail: "https://bfzyapi.com",     active: true },
     { key: "suoni", name: "索尼资源", api: "https://suoniapi.com/api.php/provide/vod",    detail: "https://suoniapi.com",    active: true },
@@ -42,6 +44,87 @@ const DEFAULT_SITES = [
     { key: "hwk",   name: "海外看",   api: "https://haiwaikan.com/api.php/provide/vod",   detail: "https://haiwaikan.com",   active: true },
     { key: "bdzy",  name: "百度资源", api: "https://api.apibdzy.com/api.php/provide/vod", detail: "https://apibdzy.com",     active: true },
 ];
+
+// 采集站偶尔会按服务器出口屏蔽某个域名。请求失败时切换同站备用域名，
+// 一旦备用地址成功，后续请求会直接复用它，避免每次先等待坏地址超时。
+const CMS_API_GROUPS = [
+    [LZZY_API_PRIMARY, LZZY_API_FALLBACK],
+];
+const cmsProbeClient = axios.create();
+const cmsPreferredApis = CMS_API_GROUPS.map(() => null);
+const cmsApiProbePromises = CMS_API_GROUPS.map(() => null);
+
+async function resolveCmsApi(groupIndex) {
+    if (cmsPreferredApis[groupIndex]) return cmsPreferredApis[groupIndex];
+    if (cmsApiProbePromises[groupIndex]) return cmsApiProbePromises[groupIndex];
+
+    const group = CMS_API_GROUPS[groupIndex];
+    cmsApiProbePromises[groupIndex] = Promise.any(group.map(async api => {
+        const response = await cmsProbeClient.get(`${api}?ac=videolist&pg=1&out=json`, { timeout: 3500 });
+        if (!response.data || typeof response.data !== 'object') throw new Error('invalid CMS response');
+        return api;
+    })).catch(() => group[0]).then(api => {
+        cmsPreferredApis[groupIndex] = api;
+        console.log(`[CMS] 当前优选采集地址: ${api}`);
+        return api;
+    }).finally(() => {
+        cmsApiProbePromises[groupIndex] = null;
+    });
+    return cmsApiProbePromises[groupIndex];
+}
+
+axios.interceptors.request.use(async config => {
+    if (config.__cmsFailoverRetry || typeof config.url !== 'string') return config;
+    const groupIndex = CMS_API_GROUPS.findIndex(group => group.some(api => config.url.startsWith(api)));
+    if (groupIndex < 0) return config;
+
+    const group = CMS_API_GROUPS[groupIndex];
+    const requestedApi = group.find(api => config.url.startsWith(api));
+    const preferredApi = await resolveCmsApi(groupIndex);
+    if (requestedApi && preferredApi && requestedApi !== preferredApi) {
+        config.url = `${preferredApi}${config.url.slice(requestedApi.length)}`;
+    }
+    config.__cmsApiGroup = groupIndex;
+    config.__cmsApiEndpoint = preferredApi || requestedApi;
+    return config;
+});
+
+axios.interceptors.response.use(response => {
+    const groupIndex = response.config.__cmsApiGroup;
+    const endpoint = response.config.__cmsApiEndpoint;
+    if (Number.isInteger(groupIndex) && endpoint) cmsPreferredApis[groupIndex] = endpoint;
+    return response;
+}, async error => {
+    const config = error.config;
+    if (!config || axios.isCancel(error) || error.code === 'ERR_CANCELED') return Promise.reject(error);
+
+    const groupIndex = config.__cmsApiGroup;
+    const group = CMS_API_GROUPS[groupIndex];
+    const status = error.response?.status;
+    const canFailOver = !status || status === 403 || status === 429 || status >= 500;
+    if (!group || !canFailOver) return Promise.reject(error);
+
+    const attempted = new Set(config.__cmsApiAttempts || []);
+    if (config.__cmsApiEndpoint) attempted.add(config.__cmsApiEndpoint);
+    const nextApi = group.find(api => !attempted.has(api));
+    if (!nextApi) return Promise.reject(error);
+
+    const currentApi = group.find(api => typeof config.url === 'string' && config.url.startsWith(api));
+    if (!currentApi) return Promise.reject(error);
+    config.url = `${nextApi}${config.url.slice(currentApi.length)}`;
+    config.__cmsFailoverRetry = true;
+    config.__cmsApiEndpoint = nextApi;
+    config.__cmsApiAttempts = [...attempted];
+    console.warn(`[CMS] ${currentApi} 请求失败，切换备用地址 ${nextApi}`);
+
+    try {
+        const response = await axios.request(config);
+        cmsPreferredApis[groupIndex] = nextApi;
+        return response;
+    } catch (retryError) {
+        return Promise.reject(retryError);
+    }
+});
 
 if (!fs.existsSync(DATA_FILE) || FORCE_UPDATE) {
     // 只有在没有文件时，或者强制更新开启时，才重置配置
@@ -59,17 +142,22 @@ if (!fs.existsSync(DATA_FILE) || FORCE_UPDATE) {
 function getDB() { 
     try {
         const data = JSON.parse(fs.readFileSync(DATA_FILE));
-        // 简单的合并逻辑：确保代码里的30多个接口都在数据库里
-        if(FORCE_UPDATE) {
-            const dbSites = data.sites || [];
-            DEFAULT_SITES.forEach(defSite => {
-                if(!dbSites.find(s => s.key === defSite.key)) {
-                    dbSites.push(defSite);
-                }
+        const dbSites = Array.isArray(data.sites) ? data.sites : [];
+        const sites = dbSites.map(site => {
+            const defaultSite = DEFAULT_SITES.find(item => item.key === site.key);
+            if (!defaultSite) return site;
+            // 已有 db.json 会保留旧的量子地址；仅对官方旧地址迁移，用户自定义地址不覆盖。
+            if (site.key === 'lzzy' && [LZZY_API_PRIMARY, LZZY_API_FALLBACK].includes(site.api)) {
+                return { ...defaultSite, ...site, api: LZZY_API_PRIMARY, fallbackApis: [LZZY_API_FALLBACK] };
+            }
+            return { ...defaultSite, ...site };
+        });
+        if (FORCE_UPDATE) {
+            DEFAULT_SITES.forEach(defaultSite => {
+                if (!sites.some(site => site.key === defaultSite.key)) sites.push(defaultSite);
             });
-            return { sites: dbSites };
         }
-        return data;
+        return { ...data, sites };
     } catch(e) {
         return { sites: DEFAULT_SITES };
     }
@@ -118,7 +206,7 @@ const SEARCH_DETAIL_ENRICH_LIMIT_PER_SITE = 24;
 const ACTOR_SCAN_PAGES = 2;
 const ACTOR_SCAN_TYPE_IDS_PER_CATEGORY = 2;
 const ACTOR_SCAN_DETAIL_LIMIT_PER_PAGE = 18;
-const CATEGORY_CACHE_VERSION = 'v5';
+const CATEGORY_CACHE_VERSION = 'v6';
 const CATEGORY_DISK_CACHE_TTL = 24 * 60 * 60 * 1000;
 const CATEGORY_PREWARM_CATEGORIES = ['movie', 'tv', 'variety', 'anime', 'shortDrama', 'sports'];
 const CATEGORY_PREWARM_PAGE_SIZES = [30, 20];

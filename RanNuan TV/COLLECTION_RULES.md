@@ -1,6 +1,6 @@
 # 五站采集规则文档
 
-> 最后更新：2026-07-24
+> 最后更新：2026-07-25
 > 涵盖站点：量子资源(lzzy)、非凡影视(ffzy)、索尼资源(suoni)、百度资源(bdzy)、暴风资源(bfzy)
 
 ---
@@ -10,7 +10,7 @@
 | 项目 | 量子资源 | 非凡影视 | 索尼资源 | 百度资源 | 暴风资源 |
 |------|---------|---------|---------|---------|---------|
 | **Key** | `lzzy` | `ffzy` | `suoni` | `bdzy` | `bfzy` |
-| **API** | `cj.lziapi.com` | `cj.ffzyapi.com` | `suoniapi.com` | `api.apibdzy.com` | `bfzyapi.com` |
+| **API** | `cj.lziapi.com`（主）/ `cj.lzcaiji.com`（官方备用） | `cj.ffzyapi.com` | `suoniapi.com` | `api.apibdzy.com` | `bfzyapi.com` |
 | **CMS** | 标准 MACCMS | 标准 MACCMS | 半标准 ⚠️ | 半标准 ⚠️ | 自编编号 |
 | **短剧子类** | 无 | 无 | ✅ 8个 | ✅ 7个 | ✅ 9个 |
 | **体育子类** | ✅ 4个 | 不支持 | ✅ 3个 | ✅ 3个 | ✅ 4个 |
@@ -409,7 +409,7 @@ const isLikelyActor = /^[\u4e00-\u9fa5]{2,4}$/.test(wd) &&
 ```javascript
 // server.js — 站点列表
 const DEFAULT_SITES = [
-  { key: "lzzy",  name: "量子资源", api: "https://cj.lziapi.com/api.php/provide/vod", active: true },
+  { key: "lzzy",  name: "量子资源", api: "https://cj.lziapi.com/api.php/provide/vod", fallbackApis: ["https://cj.lzcaiji.com/api.php/provide/vod"], active: true },
   { key: "ffzy",  name: "非凡影视", api: "http://cj.ffzyapi.com/api.php/provide/vod",  active: true },
   { key: "bfzy",  name: "暴风资源", api: "https://bfzyapi.com/api.php/provide/vod",     active: true },
   { key: "suoni", name: "索尼资源", api: "https://suoniapi.com/api.php/provide/vod",    active: true },
@@ -469,3 +469,4 @@ const WORKING_SITES = ['lzzy', 'ffzy', 'bfzy', 'suoni', 'bdzy'];
 4. **量子图片全线被墙** — CDN 污染公告确认三个域名都挂了，暂时无解
 5. **暴风 Referer 防盗链** — 走服务端 `/api/img` 代理，自动加 Referer 头
 6. **父类不等于全量列表** — 分类浏览必须聚合子类；非凡短剧还位于连续剧下面(type_pid=2)
+7. **量子采集域名需要主备切换** — 官方帮助页提供 `cj.lzcaiji.com` 备用采集域名；服务端并行探测两个官方地址，自动选择并记忆当前可用地址

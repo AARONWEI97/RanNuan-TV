@@ -92,6 +92,20 @@ fun MainNavHost(api: RanNuanApi, onStartupNoticesFinished: () -> Unit = {}) {
                             selected = selected,
                             onClick = {
                                 if (selected) return@NavigationBarItem
+                                if (screen == Screen.Home) {
+                                    // 启动捐赠弹窗会把带参数的 Profile 压在 Home 上方。
+                                    // 回首页应直接弹回现有根页面，不能 restore 刚保存的 Profile 栈。
+                                    val returnedHome = navController.popBackStack(
+                                        route = Screen.Home.route,
+                                        inclusive = false
+                                    )
+                                    if (!returnedHome) {
+                                        navController.navigate(Screen.Home.route) {
+                                            launchSingleTop = true
+                                        }
+                                    }
+                                    return@NavigationBarItem
+                                }
                                 navController.navigate(screen.route) {
                                     popUpTo(navController.graph.startDestinationId) {
                                         saveState = true

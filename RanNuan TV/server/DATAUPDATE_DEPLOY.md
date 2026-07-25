@@ -132,7 +132,7 @@ scp "{APK本地路径}" root@47.108.80.234:/root/server/public/dataupdate/apk/Ra
 **示例：**
 
 ```cmd
-scp "c:\Users\AaronWei\Desktop\dongguaTV-main\RanNuan TV\apps\mobile-android\app\release\RanNuan-TV-v2.1.3.apk" root@47.108.80.234:/root/server/public/dataupdate/apk/RanNuan-TV-v2.1.3.apk
+scp "c:\Users\AaronWei\Desktop\dongguaTV-main\RanNuan TV\apps\mobile-android\app\release\RanNuanTV-v2.1.5.apk" root@47.108.80.234:/root/server/public/dataupdate/apk/RanNuanTV-v2.1.5.apk
 ```
 
 > **避免踩坑：APK 文件名不要有空格**。如果 SCP 报 `No such file or directory`，先检查文件名是否有空格，去掉再试。
@@ -219,8 +219,32 @@ rm /root/server/public/dataupdate/apk/RanNuan-TV-v2.1.1.apk
 | 5 | Android Studio 创建 JKS 报 `Tag number over 30` | GUI 创建密钥库的 JDK bug | 改用命令行 `keytool -genkey -v -keystore xxx.jks -keyalg RSA -keysize 2048 -validity 9125 -alias rannuan -storetype JKS` |
 | 6 | 第一次连接 SSH 提示 `authenticity can't be established` | 新 IP 未加入 known_hosts | 输入 `yes` 回车即可 |
 | 7 | 在服务器 SSH 里执行了本机该跑的命令 | 搞混了终端窗口 | **所有 `scp`/`certutil`/`for` 命令在本地 CMD 跑，只有服务器管理命令用 SSH** |
+| 8 | 下载 APK 返回 404 | `latest.json` 中 `downloadUrl` 的文件名与服务器上实际 APK 文件名不一致 | 上传后执行 `ssh root@47.108.80.234 "ls -la /root/server/public/dataupdate/apk/"` 确认文件名；`downloadUrl` 只写文件名不写完整路径，确保两端一致 |
 
 ---
 
-> 📅 最后更新：2026-07-24
-> 📝 v2.1
+## 五、命名规范（避免踩坑）
+
+APK 文件名统一格式：**`RanNuan-TV-v{版本}.apk`**
+
+- 正确：`RanNuan-TV-v2.1.5.apk`
+- 错误：`RanNuanTV-v2.1.5.apk`（少了横杠）、`RanNuan TV-v2.1.5.apk`（有空格）
+
+`latest.json` 中 `downloadUrl` 必须与服务器上文件名**完全一致**：
+
+```json
+"downloadUrl": "/dataupdate/apk/RanNuan-TV-v2.1.5.apk"
+```
+
+上传后务必用以下命令交叉校验：
+
+```cmd
+ssh root@47.108.80.234 "ls /root/server/public/dataupdate/apk/ && echo --- && grep downloadUrl /root/server/public/dataupdate/latest.json"
+```
+
+两边文件名必须一模一样，多一个横杠、少一个横杠都会导致 404。
+
+---
+
+> 📅 最后更新：2026-07-25
+> 📝 v2.2

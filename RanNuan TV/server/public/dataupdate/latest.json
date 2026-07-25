@@ -1,16 +1,14 @@
 {
   "enabled": true,
-  "versionCode": 8,
-  "versionName": "2.1.5",
-  "downloadUrl": "/dataupdate/apk/RanNuan-TV-v2.1.5.apk",
-  "sizeBytes": 8596975,
-  "sha256": "e701bfcf6a3834587b921a2df35c65b7b166a15f98454302eb3cfdab2f9922b5",
+  "versionCode": 9,
+  "versionName": "2.1.6",
+  "downloadUrl": "/dataupdate/apk/RanNuanTV-v2.1.6.apk",
+  "sizeBytes": 8597123,
+  "sha256": "37524736b182f13f88ef056a22db5cf6b812c9ebd9d49e12b8dfb4d0acfd9e46",
   "forceUpdate": false,
   "minSupportedVersionCode": 1,
   "publishedAt": "2026-07-25",
   "changelog": [
-    "优化分类页加载逻辑与滚动位置记忆",
-    "重构详情页与播放页的影视数据请求流程",
-    "更新更新服务器配置与APK版本信息"
+    "修复首页导航点击时的栈恢复问题，避免捐赠弹窗破坏导航栈"
   ]
 }
