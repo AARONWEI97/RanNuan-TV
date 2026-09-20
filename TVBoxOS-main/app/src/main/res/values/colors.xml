@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- RanNuan TV brand palette: warm orange on a quiet zinc surface. -->
+    <color name="color_6200EE">#F97316</color>
+    <color name="color_3700B3">#C2410C</color>
+    <color name="color_03DAC5">#FDBA74</color>
+    <color name="title_focus">#FDBA74</color>
+    <color name="title_fouse_n">@color/title_focus</color>
+    <color name="splash_bg">#FF080810</color>
+    <color name="color_1890FF">#FB923C</color>
+    <color name="color_FFB800">#F97316</color>
+    <color name="color_00FF0A">#00FF0A</color>
+    <color name="color_CBF46A">#CBF46A</color>
+    <color name="color_FF90CA09">#FB923C</color>
+    <color name="color_BD0CADE2">#BD0CADE2</color>
+    <color name="color_FF0057">#FB923C</color>
+    <color name="color_FF5F00">#EA580C</color>
+    <color name="color_00796B">#C2410C</color>
+    <color name="color_FFB6C1">#FDBA74</color>
+    <color name="color_3D3D3D">#18181B</color>
+    <color name="color_32364E">#27272A</color>
+    <color name="color_6632364E">#E609090B</color>
+    <color name="color_CCFFFFFF">#BBFFFFFF</color>
+    <color name="color_0CADE2">#FB923C</color>
+    <color name="color_6CFFFFFF">#6CFFFFFF</color>
+    <color name="color_66000000">#66000000</color>
+    <color name="color_99000000">#99000000</color>
+    <color name="color_FFFFFF_50">#80FFFFFF</color>
+    <color name="color_CC000000">#CC000000</color>
+    <color name="color_000000_30">#48000000</color>
+    <color name="color_02F8E1">#FDBA74</color>
+    <color name="color_353744">#27272A</color>
+    <color name="color_CC353744">#CC27272A</color>
+    <color name="color_6C3D3D3D">#6c3d3d3d</color>
+    <color name="color_BBFFFFFF">#bbffffff</color>
+    <color name="color_FFFFFF">#ffffffff</color>
+    <color name="color_33FFFFFF">#33ffffff</color>
+    <color name="color_99FFFFFF">#4D000000</color>
+    <color name="color_59353744">#59353744</color>
+    <color name="color_80FF0057">#66FF0057</color>
+    <color name="color_000000_60">#99000000</color>
+    <color name="color_dialog_bg">#88000000</color>
+    <color name="color_scrollview_bg">#44000000</color>
+    <color name="color_text_primary">#FFFFF7ED</color>
+
+    <!-- Home glassmorphism palette. Keep the supplied photo visible underneath. -->
+    <color name="home_scrim_top">#80080A10</color>
+    <color name="home_scrim_mid">#6611131A</color>
+    <color name="home_scrim_bottom">#B80A0C12</color>
+    <color name="glass_surface">#66191B21</color>
+    <color name="glass_surface_elevated">#8C23262D</color>
+    <color name="glass_surface_focused">#52F97316</color>
+    <color name="glass_stroke">#38FFFFFF</color>
+    <color name="glass_stroke_focused">#FFFDBA74</color>
+    <color name="glass_highlight">#26FFFFFF</color>
+    <color name="glass_text_secondary">#D9FFF7ED</color>
+
+    <!-- Unified dialog palette. Change these to update dialog surfaces globally. -->
+    <color name="dialog_panel_bg">#D91D202A</color>
+    <color name="dialog_panel_stroke">#33FFFFFF</color>
+    <color name="dialog_control_bg">#80353744</color>
+    <color name="dialog_control_bg_focused">#CCF97316</color>
+    <color name="dialog_control_stroke">#22FFFFFF</color>
+    <color name="dialog_control_stroke_focused">#CCFDBA74</color>
+    <color name="dialog_input_bg">#66353744</color>
+    <color name="dialog_text_primary">#FFFFFFFF</color>
+    <color name="dialog_text_hint">#80FFFFFF</color>
+
+
+
+</resources>
